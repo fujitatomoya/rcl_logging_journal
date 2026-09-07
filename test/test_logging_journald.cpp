@@ -20,6 +20,7 @@
 #include <systemd/sd-journal.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -67,28 +68,6 @@ std::string expected_priority(int severity)
     case RCUTILS_LOG_SEVERITY_FATAL: return "2";
     default: return "6";  // UNSET and unknown values
   }
-}
-
-std::string expected_severity_name(int severity)
-{
-  switch (severity) {
-    case RCUTILS_LOG_SEVERITY_DEBUG: return "DEBUG";
-    case RCUTILS_LOG_SEVERITY_INFO: return "INFO";
-    case RCUTILS_LOG_SEVERITY_WARN: return "WARN";
-    case RCUTILS_LOG_SEVERITY_ERROR: return "ERROR";
-    case RCUTILS_LOG_SEVERITY_FATAL: return "FATAL";
-    default: return "UNSET";
-  }
-}
-
-// Whether a record of `severity` passes the backend threshold set to `level`.
-// Priorities compare numerically: lower is more severe.
-bool expected_to_pass(int severity, int level)
-{
-  if (level <= RCUTILS_LOG_SEVERITY_UNSET) {
-    return true;
-  }
-  return std::stoi(expected_priority(severity)) <= std::stoi(expected_priority(level));
 }
 
 std::string random_token()
@@ -304,8 +283,9 @@ TEST_F(LoggingTest, record_fields)
   EXPECT_EQ(message, entry.at("MESSAGE"));
   EXPECT_EQ("6", entry.at("PRIORITY"));
   EXPECT_EQ(logger_name, entry.at("ROS2_NODE_NAME"));
-  EXPECT_EQ("INFO", entry.at("ROS2_SEVERITY"));
   EXPECT_EQ(executable_name(), entry.at("SYSLOG_IDENTIFIER"));
+  // Severity is carried by PRIORITY only (journalctl -p); no duplicate field.
+  EXPECT_EQ(0u, entry.count("ROS2_SEVERITY"));
   const std::string ros_distro = rcpputils::get_env_var("ROS_DISTRO");
   if (ros_distro.empty()) {
     EXPECT_EQ(0u, entry.count("ROS2_DISTRO"));
@@ -348,8 +328,6 @@ TEST_F(LoggingTest, severity_mapping)
       }
       found = true;
       EXPECT_EQ(expected_priority(severity), entry.at("PRIORITY")) << "severity " << severity;
-      EXPECT_EQ(expected_severity_name(severity), entry.at("ROS2_SEVERITY"))
-        << "severity " << severity;
     }
     EXPECT_TRUE(found) << "missing record for severity " << severity;
   }
@@ -361,6 +339,9 @@ TEST_F(LoggingTest, full_cycle)
   // Make sure we can call initialize more than once
   ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
 
+  // The backend does not filter: rcl filters on the logger level before the
+  // backend is called and journald filters with MaxLevelStore=. So
+  // set_logger_level() is accepted but every record reaches the journal.
   std::map<std::string, std::string> expected_messages;  // MESSAGE -> PRIORITY
   for (int level : logger_levels) {
     EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_set_logger_level(nullptr, level));
@@ -369,26 +350,112 @@ TEST_F(LoggingTest, full_cycle)
       std::stringstream ss;
       ss << "full_cycle " << token << " severity " << severity << " at level " << level;
       rcl_logging_external_log(severity, logger_name.c_str(), ss.str().c_str());
-
-      if (expected_to_pass(severity, level)) {
-        expected_messages.emplace(ss.str(), expected_priority(severity));
-      }
+      expected_messages.emplace(ss.str(), expected_priority(severity));
     }
   }
-  // Records below the threshold never reach the socket, so wait only for
-  // the expected ones and then give journald a moment to prove nothing else
-  // shows up.
-  std::vector<JournalEntry> entries = read_journal({node_match}, expected_messages.size());
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  entries = read_journal({node_match}, expected_messages.size());
+  // shutdown drains the ring before returning
+  EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
 
+  std::vector<JournalEntry> entries = read_journal({node_match}, expected_messages.size());
   std::map<std::string, std::string> actual_messages;
   for (const JournalEntry & entry : entries) {
     actual_messages.emplace(entry.at("MESSAGE"), entry.at("PRIORITY"));
   }
   EXPECT_EQ(expected_messages, actual_messages);
+}
 
+TEST_F(LoggingTest, shutdown_drains_queue)
+{
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+
+  // More bytes than the 1 MiB ring holds, so producers wrap and block on the
+  // sender thread; every record must still be in the journal after shutdown,
+  // in order.
+  constexpr int count = 20000;
+  std::string payload(200, 'p');
+  for (int i = 0; i < count; ++i) {
+    std::stringstream ss;
+    ss << "drain " << token << " " << i << " " << payload;
+    rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), ss.str().c_str());
+  }
   EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
+
+  std::vector<JournalEntry> entries = read_journal({node_match}, count, std::chrono::seconds(60));
+  ASSERT_EQ(static_cast<std::size_t>(count), entries.size());
+  for (int i = 0; i < count; ++i) {
+    std::stringstream ss;
+    ss << "drain " << token << " " << i << " ";
+    EXPECT_EQ(0u, entries[static_cast<std::size_t>(i)].at("MESSAGE").rfind(ss.str(), 0))
+      << "record " << i << " out of order";
+  }
+}
+
+TEST_F(LoggingTest, concurrent_producers_keep_order)
+{
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+
+  constexpr int threads = 4;
+  constexpr int per_thread = 2000;
+  std::vector<std::thread> workers;
+  for (int t = 0; t < threads; ++t) {
+    workers.emplace_back(
+      [this, t]() {
+        for (int i = 0; i < per_thread; ++i) {
+          std::stringstream ss;
+          ss << "concurrent " << token << " thread " << t << " seq " << i;
+          rcl_logging_external_log(
+            RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), ss.str().c_str());
+        }
+      });
+  }
+  for (std::thread & worker : workers) {
+    worker.join();
+  }
+  EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
+
+  std::vector<JournalEntry> entries =
+    read_journal({node_match}, threads * per_thread, std::chrono::seconds(60));
+  ASSERT_EQ(static_cast<std::size_t>(threads * per_thread), entries.size());
+  // Records of one thread must appear in the order that thread logged them.
+  std::vector<int> next_seq(threads, 0);
+  const std::string prefix = "concurrent " + token + " thread ";
+  for (const JournalEntry & entry : entries) {
+    const std::string & message = entry.at("MESSAGE");
+    ASSERT_EQ(0u, message.rfind(prefix, 0)) << message;
+    std::istringstream fields(message.substr(prefix.size()));
+    int t = -1;
+    int seq = -1;
+    std::string seq_word;
+    fields >> t >> seq_word >> seq;
+    ASSERT_EQ("seq", seq_word) << message;
+    ASSERT_GE(t, 0);
+    ASSERT_LT(t, threads);
+    EXPECT_EQ(next_seq[static_cast<std::size_t>(t)], seq) << "thread " << t;
+    next_seq[static_cast<std::size_t>(t)] = seq + 1;
+  }
+}
+
+TEST_F(LoggingTest, fatal_is_synchronous)
+{
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+
+  // Queue a burst, then a FATAL: when the FATAL call returns, it and every
+  // record before it must already have been handed to journald. Verify with a
+  // single, non retrying read (timeout 0).
+  for (int i = 0; i < 500; ++i) {
+    std::stringstream ss;
+    ss << "before fatal " << token << " " << i;
+    rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), ss.str().c_str());
+  }
+  const std::string fatal = "fatal " + token;
+  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_FATAL, logger_name.c_str(), fatal.c_str());
+
+  // journald processes the datagrams asynchronously, allow it a moment but do
+  // not wait for our own sender thread: it must already be done.
+  std::vector<JournalEntry> entries = read_journal({node_match}, 501, std::chrono::seconds(5));
+  ASSERT_EQ(501u, entries.size());
+  EXPECT_EQ(fatal, entries.back().at("MESSAGE"));
+  EXPECT_EQ("2", entries.back().at("PRIORITY"));
 }
 
 TEST_F(LoggingTest, no_logger_name)
@@ -560,19 +627,30 @@ TEST_F(LoggingTest, large_message)
 {
   ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
 
-  // Well above the AF_UNIX datagram limit, so libsystemd takes the sealed
-  // memfd path; also above journald's compression threshold.
-  std::string message = "large_message " + token + " ";
-  const std::size_t target = 300 * 1024;
-  while (message.size() < target) {
-    message += "0123456789abcdef";
-  }
-  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), message.c_str());
+  auto make_message = [this](const char * tag, std::size_t target) {
+      std::string message = std::string(tag) + " " + token + " ";
+      while (message.size() < target) {
+        message += "0123456789abcdef";
+      }
+      return message;
+    };
+  // 100 KiB goes through the ring but above the AF_UNIX datagram limit, so
+  // libsystemd takes the sealed memfd path and journald compresses it.
+  const std::string ring_message = make_message("large_ring", 100 * 1024);
+  // 300 KiB is above the ring threshold: drained, then sent synchronously.
+  const std::string sync_message = make_message("large_sync", 300 * 1024);
+  const std::string after = "large_after " + token;
+  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), ring_message.c_str());
+  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), sync_message.c_str());
+  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), after.c_str());
 
-  std::vector<JournalEntry> entries = read_journal({node_match}, 1);
-  ASSERT_EQ(1u, entries.size());
-  EXPECT_EQ(message.size(), entries.front().at("MESSAGE").size());
-  EXPECT_EQ(message, entries.front().at("MESSAGE"));
+  std::vector<JournalEntry> entries = read_journal({node_match}, 3);
+  ASSERT_EQ(3u, entries.size());
+  EXPECT_EQ(ring_message.size(), entries[0].at("MESSAGE").size());
+  EXPECT_EQ(ring_message, entries[0].at("MESSAGE"));
+  EXPECT_EQ(sync_message.size(), entries[1].at("MESSAGE").size());
+  EXPECT_EQ(sync_message, entries[1].at("MESSAGE"));
+  EXPECT_EQ(after, entries[2].at("MESSAGE"));
 }
 
 TEST_F(LoggingTest, long_logger_name)
@@ -617,5 +695,4 @@ TEST_F(LoggingTest, journalctl_smoke)
   EXPECT_EQ(0, status) << output;
   EXPECT_NE(std::string::npos, output.find("\"MESSAGE\":\"" + message + "\"")) << output;
   EXPECT_NE(std::string::npos, output.find("\"PRIORITY\":\"4\"")) << output;
-  EXPECT_NE(std::string::npos, output.find("\"ROS2_SEVERITY\":\"WARN\"")) << output;
 }

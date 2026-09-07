@@ -59,25 +59,28 @@ def table(headers, rows):
 def report_b1(rows):
     print('## B1 client call latency\n')
     print('Latency of one `rcl_logging_external_log()` call as seen by the caller, '
-          'in microseconds.\n')
+          'in microseconds. "sustained" issues calls as fast as possible and is bound '
+          'by the throughput of the slowest stage (for journald: the daemon), "burst" '
+          'issues N calls back to back and then pauses, like a node with a periodic '
+          'callback; calls/s is only meaningful for sustained runs.\n')
     body = []
     for r in rows:
         body.append([
-            r['backend'], r['size'], r['severity'],
+            r['backend'], r.get('mode', 'sustained'), r['size'], r['severity'],
             us(r['p50_ns']), us(r['p95_ns']), us(r['p99_ns']), us(r.get('p999_ns', 0)),
             us(r['max_ns']), f"{r['calls_per_sec']:,.0f}",
         ])
     print(table(
-        ['backend', 'size', 'severity', 'p50 us', 'p95 us', 'p99 us', 'p99.9 us', 'max us',
-         'calls/s'],
+        ['backend', 'mode', 'size', 'severity', 'p50 us', 'p95 us', 'p99 us', 'p99.9 us',
+         'max us', 'calls/s'],
         body))
     print()
 
 
 def report_b2(rows):
     print('## B2 system CPU per record\n')
-    print('CPU time of the application plus the log daemons (journald, and rsyslogd for the '
-          'syslog backend), in CPU milliseconds per 1000 records.\n')
+    print('CPU time of the application plus systemd-journald, '
+          'in CPU milliseconds per 1000 records.\n')
     body = []
     for r in rows:
         app = r['cpu_user_sec'] + r['cpu_sys_sec']

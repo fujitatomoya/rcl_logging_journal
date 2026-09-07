@@ -84,7 +84,6 @@ journalctl ROS2_NODE_NAME=talker -o verbose -n 1
     MESSAGE=[INFO] [1757236501.620827927] [talker]: Publishing: 'Hello World: 1'
     PRIORITY=6
     ROS2_NODE_NAME=talker
-    ROS2_SEVERITY=INFO
     SYSLOG_IDENTIFIER=talker
     ROS2_DISTRO=rolling
 ```

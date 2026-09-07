@@ -19,15 +19,28 @@
 // as an indexed, deduplicated object, so `journalctl ROS2_NODE_NAME=talker`
 // is an index lookup rather than a text scan.
 //
+// Hot path design (see doc/design.md, section 4.7):
+//   rcl_logging_external_log() copies the record into a preallocated ring
+//   buffer under a mutex and returns. One sender thread drains the ring and
+//   performs the sd_journal_sendv() (one sendmsg() and a journald wake up per
+//   record, several microseconds) off the caller's thread. This is the same
+//   idea as rcl_logging_spdlog's buffered file sink: the caller pays a memcpy,
+//   the I/O happens later. FATAL records are the exception: the caller waits
+//   until the record has been handed to journald, which fsyncs CRIT and above
+//   immediately, so a FATAL followed by a crash is on disk.
+//
 // Record schema (see doc/design.md, section 4.5):
 //   MESSAGE=<msg>                  formatted message as received from rcl
 //   PRIORITY=<0..7>                syslog priority mapped from RCUTILS severity
-//   SYSLOG_IDENTIFIER=<id>         executable name unless overridden
 //   ROS2_NODE_NAME=<logger name>   omitted when rcl passes no logger name
-//   ROS2_SEVERITY=<DEBUG..FATAL>   original ROS wording
+//   SYSLOG_IDENTIFIER=<id>         executable name unless overridden
 //   ROS2_DISTRO=<$ROS_DISTRO>      omitted when ROS_DISTRO is not set
 //   <RCL_LOGGING_JOURNAL_EXTRA_FIELDS...>
 // journald adds the trusted _PID, _UID, _COMM, _EXE, _BOOT_ID, ... fields.
+//
+// Severity filtering is not done here: rcl already filters on the logger
+// level before calling the backend, and journald can filter with
+// MaxLevelStore= in journald.conf(5).
 
 // Without this, <systemd/sd-journal.h> turns sd_journal_sendv() into a macro
 // that stamps CODE_FILE/CODE_LINE/CODE_FUNC of *this* file on every record,
@@ -35,6 +48,7 @@
 // available through rcl_logging_interface).
 #define SD_JOURNAL_SUPPRESS_LOCATION
 
+#include <pthread.h>
 #include <sys/uio.h>
 #include <syslog.h>
 #include <systemd/sd-journal.h>
@@ -43,11 +57,14 @@
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rcpputils/env.hpp"
@@ -80,112 +97,399 @@ constexpr const char * kDefaultSocketPath = "/run/systemd/journal/socket";
 
 // Field names this backend emits itself; they are rejected in EXTRA_FIELDS.
 constexpr const char * kReservedFieldNames[] = {
-  "MESSAGE", "PRIORITY", "SYSLOG_IDENTIFIER",
-  "ROS2_NODE_NAME", "ROS2_SEVERITY", "ROS2_DISTRO",
+  "MESSAGE", "PRIORITY", "SYSLOG_IDENTIFIER", "ROS2_NODE_NAME", "ROS2_DISTRO",
 };
 
 // journald limits (src/libsystemd/sd-journal/journal-file.h: 64 chars).
 constexpr std::size_t kMaxFieldNameLength = 64;
-// Upper bound so the per-call iovec array can live on the stack.
+// Upper bound so the per-record iovec array can live on the stack.
 constexpr std::size_t kMaxExtraFields = 32;
-// Per-call fields: MESSAGE, PRIORITY, ROS2_SEVERITY, ROS2_NODE_NAME.
-constexpr std::size_t kMaxDynamicFields = 4;
+// Per-record fields: MESSAGE, PRIORITY, ROS2_NODE_NAME.
+constexpr std::size_t kMaxDynamicFields = 3;
 // Constant fields besides extra fields: SYSLOG_IDENTIFIER, ROS2_DISTRO.
 constexpr std::size_t kMaxConstantFields = 2 + kMaxExtraFields;
-// Stack scratch for "MESSAGE=<msg>"; larger messages fall back to the heap.
-constexpr std::size_t kMessageStackBuffer = 4096;
-// Stack scratch for "ROS2_NODE_NAME=<name>".
-constexpr std::size_t kNodeNameStackBuffer = 512;
 
-struct SeverityInfo
-{
-  int priority;
-  const char * priority_field;
-  std::size_t priority_field_len;
-  const char * severity_field;
-  std::size_t severity_field_len;
+constexpr char kMessagePrefix[] = "MESSAGE=";
+constexpr std::size_t kMessagePrefixLen = sizeof(kMessagePrefix) - 1;
+constexpr char kNodeNamePrefix[] = "ROS2_NODE_NAME=";
+constexpr std::size_t kNodeNamePrefixLen = sizeof(kNodeNamePrefix) - 1;
+
+// Ring buffer between the logging threads and the sender thread. 1 MiB holds
+// roughly 8000 typical records; pages are only touched as they get used.
+constexpr std::size_t kRingCapacity = 1u << 20;
+// Records larger than this bypass the ring and are sent synchronously (after
+// draining the ring so ordering is preserved). Covers backtraces and dumps.
+constexpr std::size_t kRingSyncThreshold = kRingCapacity / 4;
+// Stack scratch for the synchronous path; larger values fall back to the heap.
+constexpr std::size_t kSyncStackBuffer = 4096;
+
+// "PRIORITY=n" for n in 0..7, selected by index, no formatting on the hot path.
+constexpr const char * kPriorityFields[8] = {
+  "PRIORITY=0", "PRIORITY=1", "PRIORITY=2", "PRIORITY=3",
+  "PRIORITY=4", "PRIORITY=5", "PRIORITY=6", "PRIORITY=7",
 };
+constexpr std::size_t kPriorityFieldLen = sizeof("PRIORITY=0") - 1;
 
-#define RCL_LOGGING_JOURNAL_FIELD(str) str, sizeof(str) - 1
-
-constexpr SeverityInfo kSeverityDebug = {
-  LOG_DEBUG,
-  RCL_LOGGING_JOURNAL_FIELD("PRIORITY=7"),
-  RCL_LOGGING_JOURNAL_FIELD("ROS2_SEVERITY=DEBUG")};
-constexpr SeverityInfo kSeverityInfo = {
-  LOG_INFO,
-  RCL_LOGGING_JOURNAL_FIELD("PRIORITY=6"),
-  RCL_LOGGING_JOURNAL_FIELD("ROS2_SEVERITY=INFO")};
-constexpr SeverityInfo kSeverityWarn = {
-  LOG_WARNING,
-  RCL_LOGGING_JOURNAL_FIELD("PRIORITY=4"),
-  RCL_LOGGING_JOURNAL_FIELD("ROS2_SEVERITY=WARN")};
-constexpr SeverityInfo kSeverityError = {
-  LOG_ERR,
-  RCL_LOGGING_JOURNAL_FIELD("PRIORITY=3"),
-  RCL_LOGGING_JOURNAL_FIELD("ROS2_SEVERITY=ERROR")};
-constexpr SeverityInfo kSeverityFatal = {
-  LOG_CRIT,
-  RCL_LOGGING_JOURNAL_FIELD("PRIORITY=2"),
-  RCL_LOGGING_JOURNAL_FIELD("ROS2_SEVERITY=FATAL")};
-// RCUTILS_LOG_SEVERITY_UNSET and unknown values are reported as INFO
-// (design.md 4.3) but keep the original wording so they stay identifiable.
-constexpr SeverityInfo kSeverityUnset = {
-  LOG_INFO,
-  RCL_LOGGING_JOURNAL_FIELD("PRIORITY=6"),
-  RCL_LOGGING_JOURNAL_FIELD("ROS2_SEVERITY=UNSET")};
-
-#undef RCL_LOGGING_JOURNAL_FIELD
-
-const SeverityInfo & severity_info(int severity)
+// design.md 4.3: DEBUG->7, INFO->6, WARN->4, ERROR->3, FATAL->2, other->6.
+int severity_to_priority(int severity)
 {
   switch (severity) {
     case RCUTILS_LOG_SEVERITY_DEBUG:
-      return kSeverityDebug;
+      return LOG_DEBUG;
     case RCUTILS_LOG_SEVERITY_INFO:
-      return kSeverityInfo;
+      return LOG_INFO;
     case RCUTILS_LOG_SEVERITY_WARN:
-      return kSeverityWarn;
+      return LOG_WARNING;
     case RCUTILS_LOG_SEVERITY_ERROR:
-      return kSeverityError;
+      return LOG_ERR;
     case RCUTILS_LOG_SEVERITY_FATAL:
-      return kSeverityFatal;
+      return LOG_CRIT;
     default:
-      return kSeverityUnset;
+      return LOG_INFO;
   }
 }
 
-// Threshold used by set_logger_level(): a record is emitted when its journald
-// priority is numerically <= the threshold (lower number = more severe).
-int level_to_priority_threshold(int level)
+// Constant fields shared by every record, built once at initialization.
+struct ConstantFields
 {
-  if (level <= RCUTILS_LOG_SEVERITY_UNSET) {
-    // "unset" means no filtering by the backend at all.
-    return LOG_DEBUG;
+  std::string identifier_field;             // "SYSLOG_IDENTIFIER=<id>"
+  std::string distro_field;                 // "ROS2_DISTRO=<distro>" or empty
+  std::vector<std::string> extra_fields;    // "KEY=VALUE" ...
+  std::size_t iov_count = 0;
+  struct iovec iov[kMaxConstantFields];
+
+  void add(const std::string & field)
+  {
+    // Callers guarantee the capacity: 2 + kMaxExtraFields.
+    iov[iov_count].iov_base = const_cast<char *>(field.data());
+    iov[iov_count].iov_len = field.size();
+    ++iov_count;
   }
-  return severity_info(level).priority;
+};
+
+// Sends one record synchronously. `name_field`/`message_field` are complete
+// "KEY=VALUE" buffers. Returns the sd_journal_sendv() result.
+int send_fields(
+  const ConstantFields & constants,
+  int priority,
+  const char * name_field, std::size_t name_field_len,
+  const char * message_field, std::size_t message_field_len)
+{
+  struct iovec iov[kMaxDynamicFields + kMaxConstantFields];
+  std::size_t n = 0;
+  iov[n].iov_base = const_cast<char *>(message_field);
+  iov[n++].iov_len = message_field_len;
+  iov[n].iov_base = const_cast<char *>(kPriorityFields[priority]);
+  iov[n++].iov_len = kPriorityFieldLen;
+  if (name_field_len != 0) {
+    iov[n].iov_base = const_cast<char *>(name_field);
+    iov[n++].iov_len = name_field_len;
+  }
+  std::memcpy(&iov[n], constants.iov, constants.iov_count * sizeof(struct iovec));
+  n += constants.iov_count;
+  // sd_journal_sendv() sends one AF_UNIX datagram and transparently falls
+  // back to a sealed memfd when the record exceeds the datagram size.
+  return sd_journal_sendv(iov, static_cast<int>(n));
 }
+
+// Composes the KEY=VALUE buffers on the stack (heap for big values) and sends.
+int send_direct(
+  const ConstantFields & constants,
+  int priority,
+  const char * name, std::size_t name_len,
+  const char * msg, std::size_t msg_len)
+{
+  const std::size_t message_field_len = kMessagePrefixLen + msg_len;
+  const std::size_t name_field_len = (name_len != 0) ? kNodeNamePrefixLen + name_len : 0;
+  char stack[kSyncStackBuffer];
+  std::unique_ptr<char[]> heap;
+  char * buffer = stack;
+  if (message_field_len + name_field_len > sizeof(stack)) {
+    heap.reset(new char[message_field_len + name_field_len]);
+    buffer = heap.get();
+  }
+  std::memcpy(buffer, kMessagePrefix, kMessagePrefixLen);
+  std::memcpy(buffer + kMessagePrefixLen, msg, msg_len);
+  char * name_field = buffer + message_field_len;
+  if (name_field_len != 0) {
+    std::memcpy(name_field, kNodeNamePrefix, kNodeNamePrefixLen);
+    std::memcpy(name_field + kNodeNamePrefixLen, name, name_len);
+  }
+  return send_fields(
+    constants, priority, name_field, name_field_len, buffer, message_field_len);
+}
+
+// Single producer-side mutex, single consumer thread, preallocated byte ring.
+//
+// Layout of one slot (8 byte aligned):
+//   RecordHeader { total_len, kind, priority, name_field_len }
+//   "ROS2_NODE_NAME=<name>"   name_field_len bytes (0 when no logger name)
+//   "MESSAGE=<msg>"           total_len - sizeof(header) - name_field_len bytes
+// A kind == kPad slot fills the gap at the end of the buffer when a record
+// does not fit contiguously; the consumer skips it and wraps to offset 0.
+class Sender
+{
+public:
+  explicit Sender(const ConstantFields & constants)
+  : constants_(constants),
+    buffer_(new char[kRingCapacity]),
+    worker_(&Sender::run, this)
+  {
+  }
+
+  ~Sender()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_data_.notify_one();
+    cv_space_.notify_all();
+    cv_sent_.notify_all();
+    if (forked_child_.load(std::memory_order_relaxed)) {
+      // The worker thread does not exist in a forked child; do not join it.
+      worker_.detach();
+    } else {
+      // Drains everything still queued before returning.
+      worker_.join();
+    }
+  }
+
+  // Copies the record into the ring and returns. Blocks only when the ring is
+  // full (journald slower than the producers) or when wait_until_sent is set.
+  void enqueue(
+    int priority,
+    const char * name, std::size_t name_len,
+    const char * msg, std::size_t msg_len,
+    bool wait_until_sent)
+  {
+    if (forked_child_.load(std::memory_order_relaxed)) {
+      // No worker thread on this side of fork(): send synchronously.
+      if (send_direct(constants_, priority, name, name_len, msg, msg_len) < 0) {
+        failures_.fetch_add(1, std::memory_order_relaxed);
+      }
+      return;
+    }
+
+    const std::size_t name_field_len = (name_len != 0) ? kNodeNamePrefixLen + name_len : 0;
+    const std::size_t message_field_len = kMessagePrefixLen + msg_len;
+    const std::size_t total_len = sizeof(RecordHeader) + name_field_len + message_field_len;
+    const std::size_t advance = round_up(total_len);
+    if (advance > kRingSyncThreshold || name_field_len > UINT16_MAX) {
+      // Too big for the ring: drain what is queued so ordering is kept, then
+      // send from this thread (libsystemd uses a sealed memfd for big records).
+      flush();
+      if (send_direct(constants_, priority, name, name_len, msg, msg_len) < 0) {
+        failures_.fetch_add(1, std::memory_order_relaxed);
+      }
+      return;
+    }
+
+    std::uint64_t seq = 0;
+    bool wake_consumer = false;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      while (!reserve(advance)) {
+        if (stop_) {
+          return;
+        }
+        ++space_waiters_;
+        cv_space_.wait(lock);
+        --space_waiters_;
+      }
+      RecordHeader header;
+      header.total_len = static_cast<std::uint32_t>(total_len);
+      header.kind = kRecord;
+      header.priority = static_cast<std::uint8_t>(priority);
+      header.name_field_len = static_cast<std::uint16_t>(name_field_len);
+      char * slot = buffer_.get() + tail_;
+      std::memcpy(slot, &header, sizeof(header));
+      char * cursor = slot + sizeof(header);
+      if (name_field_len != 0) {
+        std::memcpy(cursor, kNodeNamePrefix, kNodeNamePrefixLen);
+        std::memcpy(cursor + kNodeNamePrefixLen, name, name_len);
+        cursor += name_field_len;
+      }
+      std::memcpy(cursor, kMessagePrefix, kMessagePrefixLen);
+      std::memcpy(cursor + kMessagePrefixLen, msg, msg_len);
+      tail_ += advance;
+      if (tail_ == kRingCapacity) {
+        tail_ = 0;
+      }
+      used_ += advance;
+      seq = ++enqueued_;
+      wake_consumer = consumer_waiting_;
+    }
+    if (wake_consumer) {
+      cv_data_.notify_one();
+    }
+    if (wait_until_sent) {
+      wait_for(seq);
+    }
+  }
+
+  // Blocks until every record enqueued so far has been handed to journald.
+  void flush()
+  {
+    std::uint64_t seq = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      seq = enqueued_;
+    }
+    wait_for(seq);
+  }
+
+  std::uint64_t failures() const
+  {
+    return failures_.load(std::memory_order_relaxed);
+  }
+
+  static void on_fork_child()
+  {
+    forked_child_.store(true, std::memory_order_relaxed);
+  }
+
+private:
+  enum : std::uint8_t { kRecord = 0, kPad = 1 };
+
+  struct RecordHeader
+  {
+    std::uint32_t total_len;       // header + name field + message field
+    std::uint8_t kind;             // kRecord or kPad (total_len = pad length)
+    std::uint8_t priority;         // 0..7
+    std::uint16_t name_field_len;  // 0 when there is no logger name
+  };
+  static_assert(sizeof(RecordHeader) == 8, "ring slots are 8 byte aligned");
+
+  static std::size_t round_up(std::size_t n)
+  {
+    return (n + 7u) & ~static_cast<std::size_t>(7u);
+  }
+
+  // Makes room for `advance` bytes at tail_, inserting a pad slot when the
+  // record would not be contiguous. Caller holds mutex_.
+  bool reserve(std::size_t advance)
+  {
+    if (tail_ + advance <= kRingCapacity) {
+      return kRingCapacity - used_ >= advance;
+    }
+    const std::size_t pad = kRingCapacity - tail_;  // >= 8, multiple of 8
+    if (kRingCapacity - used_ < pad + advance) {
+      return false;
+    }
+    RecordHeader header;
+    header.total_len = static_cast<std::uint32_t>(pad);
+    header.kind = kPad;
+    header.priority = 0;
+    header.name_field_len = 0;
+    std::memcpy(buffer_.get() + tail_, &header, sizeof(header));
+    used_ += pad;
+    tail_ = 0;
+    return true;
+  }
+
+  void wait_for(std::uint64_t seq)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++flush_waiters_;
+    while (sent_ < seq && !stop_) {
+      cv_sent_.wait(lock);
+    }
+    --flush_waiters_;
+  }
+
+  void run()
+  {
+    pthread_setname_np(pthread_self(), "rcl_journal");
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      while (used_ == 0 && !stop_) {
+        consumer_waiting_ = true;
+        cv_data_.wait(lock);
+        consumer_waiting_ = false;
+      }
+      if (used_ == 0) {
+        break;  // stop_ requested and everything drained
+      }
+      RecordHeader header;
+      std::memcpy(&header, buffer_.get() + head_, sizeof(header));
+      if (header.kind == kPad) {
+        used_ -= header.total_len;
+        head_ = 0;
+        continue;
+      }
+      const std::size_t advance = round_up(header.total_len);
+      const char * name_field = buffer_.get() + head_ + sizeof(header);
+      const char * message_field = name_field + header.name_field_len;
+      const std::size_t message_field_len =
+        header.total_len - sizeof(header) - header.name_field_len;
+      lock.unlock();
+
+      // Producers never write into [head_, head_ + advance) until head_ moves,
+      // so the record can be sent straight from the ring without a copy.
+      if (send_fields(
+          constants_, header.priority,
+          name_field, header.name_field_len,
+          message_field, message_field_len) < 0)
+      {
+        failures_.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      lock.lock();
+      head_ += advance;
+      if (head_ == kRingCapacity) {
+        head_ = 0;
+      }
+      used_ -= advance;
+      ++sent_;
+      if (space_waiters_ != 0) {
+        cv_space_.notify_all();
+      }
+      if (flush_waiters_ != 0) {
+        cv_sent_.notify_all();
+      }
+    }
+  }
+
+  const ConstantFields & constants_;
+  std::unique_ptr<char[]> buffer_;
+
+  std::mutex mutex_;
+  std::condition_variable cv_data_;   // ring became non-empty
+  std::condition_variable cv_space_;  // ring has room again
+  std::condition_variable cv_sent_;   // sent_ advanced
+  std::size_t head_ = 0;   // consumer read offset
+  std::size_t tail_ = 0;   // producer write offset
+  std::size_t used_ = 0;   // bytes committed, including pad slots
+  std::uint64_t enqueued_ = 0;
+  std::uint64_t sent_ = 0;
+  unsigned space_waiters_ = 0;
+  unsigned flush_waiters_ = 0;
+  bool consumer_waiting_ = false;
+  bool stop_ = false;
+
+  std::atomic<std::uint64_t> failures_{0};
+  static std::atomic<bool> forked_child_;
+
+  std::thread worker_;  // last member: started after everything above exists
+};
+
+std::atomic<bool> Sender::forked_child_{false};
 
 struct JournalState
 {
   // false when journald is absent and RCL_LOGGING_JOURNAL_STRICT=0
   // turned the backend into a no-op.
   bool enabled = true;
-  // Owning storage for the constant fields referenced by constant_iov.
-  std::string identifier_field;             // "SYSLOG_IDENTIFIER=<id>"
-  std::string distro_field;                 // "ROS2_DISTRO=<distro>" or empty
-  std::vector<std::string> extra_fields;    // "KEY=VALUE" ...
-  // Pre-built iovecs copied into every record; see rcl_logging_external_log.
-  std::size_t constant_iov_count = 0;
-  struct iovec constant_iov[kMaxConstantFields];
+  ConstantFields constants;
+  std::unique_ptr<Sender> sender;  // null when !enabled
 };
 
 // Written by initialize()/shutdown() only, read by log(). Concurrent
 // initialize/shutdown against log() is undefined, as for every other
 // rcl_logging backend.
-std::unique_ptr<const JournalState> g_state;
-std::atomic<int> g_priority_threshold{LOG_DEBUG};
-std::atomic<std::uint64_t> g_send_failures{0};
+std::unique_ptr<JournalState> g_state;
+std::once_flag g_atfork_once;
 
 bool get_env(const char * name, std::string & value)
 {
@@ -242,8 +546,8 @@ bool is_reserved_field_name(const std::string & name)
   return false;
 }
 
-// Parses "KEY=VALUE;KEY2=VALUE2" into state.extra_fields.
-bool parse_extra_fields(const std::string & raw, JournalState & state)
+// Parses "KEY=VALUE;KEY2=VALUE2" into constants.extra_fields.
+bool parse_extra_fields(const std::string & raw, ConstantFields & constants)
 {
   std::size_t begin = 0;
   while (begin <= raw.size()) {
@@ -277,41 +581,14 @@ bool parse_extra_fields(const std::string & raw, JournalState & state)
         kEnvExtraFields, token.c_str(), key.c_str(), kLoggerName);
       return false;
     }
-    if (state.extra_fields.size() >= kMaxExtraFields) {
+    if (constants.extra_fields.size() >= kMaxExtraFields) {
       RCUTILS_SET_ERROR_MSG_WITH_FORMAT_STRING(
         "%s has more than %zu entries", kEnvExtraFields, kMaxExtraFields);
       return false;
     }
-    state.extra_fields.push_back(token);
+    constants.extra_fields.push_back(token);
   }
   return true;
-}
-
-void add_constant_field(JournalState & state, const std::string & field)
-{
-  // Caller guarantees the capacity: 2 + kMaxExtraFields.
-  struct iovec & iov = state.constant_iov[state.constant_iov_count++];
-  iov.iov_base = const_cast<char *>(field.data());
-  iov.iov_len = field.size();
-}
-
-// Builds "<prefix><value>" in `stack` when it fits, otherwise on the heap.
-// Returns the pointer to use and writes the total length to `out_len`.
-const char * compose_field(
-  const char * prefix, std::size_t prefix_len,
-  const char * value, std::size_t value_len,
-  char * stack, std::size_t stack_len,
-  std::unique_ptr<char[]> & heap, std::size_t & out_len)
-{
-  out_len = prefix_len + value_len;
-  char * dst = stack;
-  if (out_len > stack_len) {
-    heap.reset(new char[out_len]);
-    dst = heap.get();
-  }
-  std::memcpy(dst, prefix, prefix_len);
-  std::memcpy(dst + prefix_len, value, value_len);
-  return dst;
 }
 
 }  // namespace
@@ -342,6 +619,7 @@ rcl_logging_ret_t rcl_logging_external_initialize(
   }
 
   auto state = std::make_unique<JournalState>();
+  ConstantFields & constants = state->constants;
 
   // 1. SYSLOG_IDENTIFIER: env override -> file name prefix -> executable name.
   std::string identifier;
@@ -367,8 +645,8 @@ rcl_logging_ret_t rcl_logging_external_initialize(
     });
     identifier = basec;
   }
-  state->identifier_field = std::string("SYSLOG_IDENTIFIER=") + identifier;
-  add_constant_field(*state, state->identifier_field);
+  constants.identifier_field = std::string("SYSLOG_IDENTIFIER=") + identifier;
+  constants.add(constants.identifier_field);
 
   // 2. ROS2_DISTRO from $ROS_DISTRO, if any.
   std::string distro;
@@ -376,8 +654,8 @@ rcl_logging_ret_t rcl_logging_external_initialize(
     return RCL_LOGGING_RET_ERROR;
   }
   if (!distro.empty()) {
-    state->distro_field = std::string("ROS2_DISTRO=") + distro;
-    add_constant_field(*state, state->distro_field);
+    constants.distro_field = std::string("ROS2_DISTRO=") + distro;
+    constants.add(constants.distro_field);
   }
 
   // 3. Static extra fields.
@@ -385,11 +663,11 @@ rcl_logging_ret_t rcl_logging_external_initialize(
   if (!get_env(kEnvExtraFields, extra_fields_raw)) {
     return RCL_LOGGING_RET_ERROR;
   }
-  if (!parse_extra_fields(extra_fields_raw, *state)) {
+  if (!parse_extra_fields(extra_fields_raw, constants)) {
     return RCL_LOGGING_RET_INVALID_ARGUMENT;
   }
-  for (const std::string & field : state->extra_fields) {
-    add_constant_field(*state, field);
+  for (const std::string & field : constants.extra_fields) {
+    constants.add(field);
   }
 
   // 4. Strict / non-strict handling of a missing journald.
@@ -430,31 +708,48 @@ rcl_logging_ret_t rcl_logging_external_initialize(
     state->enabled = false;
   }
 
+  // 6. Start the sender thread. A forked child has no copy of it, so make
+  // the child fall back to synchronous sends.
+  if (state->enabled) {
+    std::call_once(
+      g_atfork_once, []() {
+        pthread_atfork(nullptr, nullptr, &Sender::on_fork_child);
+      });
+    state->sender = std::make_unique<Sender>(state->constants);
+  }
+
   RCUTILS_LOG_DEBUG_NAMED(
     kLoggerName,
     "journald logging backend initialized: %s, %zu extra field(s), strict=%d, enabled=%d",
-    state->identifier_field.c_str(), state->extra_fields.size(),
+    constants.identifier_field.c_str(), constants.extra_fields.size(),
     strict ? 1 : 0, state->enabled ? 1 : 0);
 
-  g_priority_threshold.store(LOG_DEBUG, std::memory_order_relaxed);
-  g_send_failures.store(0, std::memory_order_relaxed);
   g_state = std::move(state);
   return RCL_LOGGING_RET_OK;
 }
 
 rcl_logging_ret_t rcl_logging_external_shutdown()
 {
-  // Nothing to flush: every sd_journal_sendv() call is a complete datagram
-  // that journald has already received once the call returns.
-  const std::uint64_t failures = g_send_failures.exchange(0, std::memory_order_relaxed);
+  if (g_state == nullptr) {
+    return RCL_LOGGING_RET_OK;
+  }
+  std::uint64_t failures = 0;
+  if (g_state->sender != nullptr) {
+    // Destroying the sender drains the ring and joins the thread; count the
+    // failures afterwards so records sent during the drain are included.
+    Sender * sender = g_state->sender.get();
+    std::unique_ptr<Sender> owned = std::move(g_state->sender);
+    sender->flush();
+    failures = sender->failures();
+    owned.reset();
+  }
+  g_state.reset();
   if (failures != 0) {
     RCUTILS_LOG_WARN_NAMED(
       kLoggerName,
       "%" PRIu64 " log record(s) could not be delivered to systemd-journald",
       failures);
   }
-  g_state.reset();
-  g_priority_threshold.store(LOG_DEBUG, std::memory_order_relaxed);
   return RCL_LOGGING_RET_OK;
 }
 
@@ -464,65 +759,20 @@ void rcl_logging_external_log(int severity, const char * name, const char * msg)
   if (state == nullptr || !state->enabled || msg == nullptr) {
     return;
   }
-
-  const SeverityInfo & info = severity_info(severity);
-  if (info.priority > g_priority_threshold.load(std::memory_order_relaxed)) {
-    return;
-  }
-
-  // MESSAGE=<msg>
-  static constexpr char kMessagePrefix[] = "MESSAGE=";
-  char message_stack[kMessageStackBuffer];
-  std::unique_ptr<char[]> message_heap;
-  std::size_t message_len = 0;
-  const char * message_field = compose_field(
-    kMessagePrefix, sizeof(kMessagePrefix) - 1,
-    msg, std::strlen(msg),
-    message_stack, sizeof(message_stack), message_heap, message_len);
-
-  struct iovec iov[kMaxDynamicFields + kMaxConstantFields];
-  std::size_t n = 0;
-  iov[n].iov_base = const_cast<char *>(message_field);
-  iov[n++].iov_len = message_len;
-  iov[n].iov_base = const_cast<char *>(info.priority_field);
-  iov[n++].iov_len = info.priority_field_len;
-  iov[n].iov_base = const_cast<char *>(info.severity_field);
-  iov[n++].iov_len = info.severity_field_len;
-
-  // ROS2_NODE_NAME=<name>, only when rcl passed a logger name.
-  static constexpr char kNodeNamePrefix[] = "ROS2_NODE_NAME=";
-  char node_name_stack[kNodeNameStackBuffer];
-  std::unique_ptr<char[]> node_name_heap;
-  if (name != nullptr && name[0] != '\0') {
-    std::size_t node_name_len = 0;
-    const char * node_name_field = compose_field(
-      kNodeNamePrefix, sizeof(kNodeNamePrefix) - 1,
-      name, std::strlen(name),
-      node_name_stack, sizeof(node_name_stack), node_name_heap, node_name_len);
-    iov[n].iov_base = const_cast<char *>(node_name_field);
-    iov[n++].iov_len = node_name_len;
-  }
-
-  // SYSLOG_IDENTIFIER, ROS2_DISTRO and extra fields, pre-built at init.
-  std::memcpy(
-    &iov[n], state->constant_iov, state->constant_iov_count * sizeof(struct iovec));
-  n += state->constant_iov_count;
-
-  // sd_journal_sendv() sends one AF_UNIX datagram and transparently falls
-  // back to a sealed memfd when the record exceeds the datagram size.
-  const int ret = sd_journal_sendv(iov, static_cast<int>(n));
-  if (ret < 0) {
-    // Never block or spin on the hot path; count it and report at shutdown.
-    g_send_failures.fetch_add(1, std::memory_order_relaxed);
-  }
+  const int priority = severity_to_priority(severity);
+  const std::size_t name_len = (name != nullptr) ? std::strlen(name) : 0;
+  // FATAL (LOG_CRIT) waits until the record is in journald's hands: journald
+  // fsyncs CRIT and above at once, so a FATAL followed by a crash is on disk.
+  state->sender->enqueue(
+    priority, name, name_len, msg, std::strlen(msg), priority <= LOG_CRIT);
 }
 
 rcl_logging_ret_t rcl_logging_external_set_logger_level(const char * name, int level)
 {
-  // v1 keeps a single, process wide threshold like rcl_logging_syslog does via
-  // setlogmask(); rcl only invokes this for the default logger today.
+  // Intentionally a no-op. rcl filters on the rcutils logger level before the
+  // backend is called, so a second threshold here only costs time; storage
+  // side filtering belongs to journald (MaxLevelStore= in journald.conf).
   (void) name;
-
-  g_priority_threshold.store(level_to_priority_threshold(level), std::memory_order_relaxed);
+  (void) level;
   return RCL_LOGGING_RET_OK;
 }

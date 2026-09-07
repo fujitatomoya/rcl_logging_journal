@@ -26,8 +26,7 @@ Everything here uses stock `journalctl`; nothing else needs to be installed.
 | field | example | meaning |
 | :---- | :------ | :------ |
 | `MESSAGE` | `[INFO] [1724869818.620827927] [talker]: Publishing: 'Hello World: 1'` | formatted message from rcl |
-| `PRIORITY` | `6` | syslog priority (DEBUG=7, INFO=6, WARN=4, ERROR=3, FATAL=2) |
-| `ROS2_SEVERITY` | `INFO` | original ROS wording |
+| `PRIORITY` | `6` | syslog priority (DEBUG=7, INFO=6, WARN=4, ERROR=3, FATAL=2), what `-p` filters on |
 | `ROS2_NODE_NAME` | `talker` | rcutils logger name (node name for node loggers, `talker.child` for sub loggers) |
 | `SYSLOG_IDENTIFIER` | `talker` | executable name unless overridden, used by `journalctl -t` |
 | `ROS2_DISTRO` | `rolling` | `$ROS_DISTRO` of the process |
@@ -59,8 +58,8 @@ journalctl _PID=31348
 # WARN and above from any ROS 2 node
 journalctl -p warning ROS2_DISTRO=rolling
 
-# ERROR and FATAL of one node, using the ROS wording
-journalctl ROS2_NODE_NAME=talker ROS2_SEVERITY=ERROR ROS2_SEVERITY=FATAL
+# ERROR and FATAL of one node
+journalctl ROS2_NODE_NAME=talker -p err
 
 # add a plain text search on top of the field matches
 journalctl ROS2_NODE_NAME=talker -g "Hello World: 4"
@@ -112,7 +111,7 @@ Example JSON record:
 
 ```json
 {"MESSAGE":"[INFO] [1724869818.620827927] [talker]: Publishing: 'Hello World: 1'",
- "PRIORITY":"6","ROS2_SEVERITY":"INFO","ROS2_NODE_NAME":"talker",
+ "PRIORITY":"6","ROS2_NODE_NAME":"talker",
  "SYSLOG_IDENTIFIER":"talker","ROS2_DISTRO":"rolling",
  "_PID":"31348","_UID":"1000","_COMM":"talker","_TRANSPORT":"journal",
  "_BOOT_ID":"376ab38eebb14eedb2304ad5aa7f5f0e","_HOSTNAME":"robot-07", "...":"..."}

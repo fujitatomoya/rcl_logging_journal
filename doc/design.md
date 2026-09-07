@@ -36,10 +36,12 @@ The main objective is:
            |
    +-------+--------+----------------------+
    |                |                      |
-journalctl     systemd-journal-       (optional, out of scope
-(filter/tail/   remote/upload,         for v1: FluentBit
- rotate/vacuum) journal-gatewayd       systemd input, rsyslog
-                                       imjournal, Loki, ...)
+journalctl     systemd-journal-       (planned, not in v1:
+(filter/tail/   remote/upload,         FluentBit systemd input,
+ rotate/vacuum) journal-gatewayd       Fluentd systemd plugin,
+                                       rsyslog imjournal, Loki, ...
+                                       same pipeline architecture
+                                       as rcl_logging_syslog)
 ```
 
 ### 1.1 Why journald and not (only) syslog?
@@ -127,10 +129,12 @@ Key properties from the [Journal File Format](https://systemd.io/JOURNAL_FILE_FO
 
 The intuition "binary format, therefore faster and smaller" needs qualification. The project commits to measuring rather than claiming:
 
-1. **Client-side call latency** (`sd_journal_sendv` vs `syslog(3)` vs spdlog file write): expected to be in the same order of magnitude, all end in one `sendmsg()`/`write()`. `sd_journal_sendv` avoids client-side `snprintf` of a syslog header but serializes multiple fields. This is the number that matters for real-time-ish ROS executors, and it is Benchmark B1.
-2. **End-to-end pipeline cost**: native journald eliminates the second daemon (rsyslogd) and double text parsing. System-wide CPU per log line is expected to drop vs the syslog/rsyslog chain. Benchmark B2.
-3. **Sustained ingestion throughput**: rsyslog is famously optimized for raw ingestion rates ("rocket-fast"); journald is not always the throughput winner, and rsyslog's own `imjournal` docs describe *reading* the journal as "relatively performance-intense" compared to socket input. For very high message rates journald's write path may saturate earlier than a tuned rsyslog file sink. Benchmark B3 quantifies the crossover.
-4. **Storage footprint**: field dedup + compact mode + zstd for large payloads is expected to beat plain text for typical ROS traffic (highly repetitive prefixes), but this depends on message entropy. Benchmark B4 compares bytes-on-disk for identical workloads across spdlog / syslog+rsyslog file sink / journald.
+1. **Client-side call latency** (`sd_journal_sendv` vs the spdlog file write): measured on a desktop, one `sendmsg()` to journald costs about 6.5 µs regardless of libsystemd or field count, while the buffered `fwrite()` of spdlog costs 0.1 µs. The backend therefore decouples the call from the syscall with a ring buffer and a sender thread (4.7); B1 measures both the sustained (throughput bound) and the bursty (typical node) caller latency.
+2. **End-to-end system cost**: spdlog pays everything in the application; journald moves work into one daemon that also indexes and deduplicates. Benchmark B2 accounts for both sides (application plus `systemd-journald` CPU).
+3. **Sustained ingestion throughput**: journald applies rate limits and its write path can saturate at extreme rates, while spdlog is bounded by the file system. Benchmark B3 shows where records start to be suppressed.
+4. **Storage footprint**: field dedup + compact mode + zstd for large payloads is expected to beat plain text for typical ROS traffic (highly repetitive prefixes), but this depends on message entropy and the index overhead is real for small volumes. Benchmark B4 compares bytes-on-disk for identical workloads between spdlog files and the journal.
+
+The comparison with `rcl_logging_syslog` (rsyslog file sink and pipelines) is deliberately **not** part of this repository's harness: that backend evaluates its own performance in its own repository. The transport analysis in 2.1 remains the rationale for the design, not a claim this harness verifies.
 5. **fsync behavior**: journald syncs on a timer (`SyncIntervalSec=`, default 5 min) but **immediately for CRIT/ALERT/EMERG**, meaning ROS `FATAL` (mapped to `LOG_CRIT`) gets durability by default, while INFO-level bursts remain buffered and fast. This is a *feature* to document, and Benchmark B1 reports FATAL separately.
 
 ### 2.4 Known operational caveats (documented, not hidden)
@@ -155,14 +159,14 @@ The intuition "binary format, therefore faster and smaller" needs qualification.
 
 ### 3.2 Non-functional
 
-- NFR1: No heap allocation on the hot logging path for typical records (stack scratch buffers, heap fallback only for messages above 4 KiB or logger names above 512 bytes) beyond what `sd_journal_sendv` itself performs; no locks besides what libsystemd requires (it is thread-safe).
+- NFR1: The caller pays a bounded, syscall free cost per record: a `memcpy` into a preallocated ring buffer under one uncontended mutex. No heap allocation and no formatting on the hot path; the `sd_journal_sendv` syscall runs on a dedicated sender thread. FATAL records are synchronous by design.
 - NFR2: No additional daemon, service file, or `/etc` configuration required for the default experience on a stock Ubuntu host.
 - NFR3: Graceful, well-defined behavior when journald is absent (initialize returns `RCL_LOGGING_RET_ERROR` with a clear rcutils error message, or no-op in non-strict mode).
 - NFR4: CI parity with `rcl_logging_syslog`: per-distro branches and workflows (humble/jazzy/kilted/lyrical/rolling + nightly).
 
 ### 3.3 Out of scope (v1)
 
-- Forwarding/aggregation (FluentBit, Loki, systemd-journal-remote), covered as *tutorials* only, since journald makes them orthogonal to the backend.
+- Forwarding/aggregation (FluentBit, Fluentd, Loki, systemd-journal-remote). This is a **temporary** limitation, not a design boundary: FluentBit (`systemd` input) and Fluentd (`fluent-plugin-systemd`) read the journal directly, so the same pipeline architecture as `rcl_logging_syslog` can be built on top of this backend and is planned as a follow-up tutorial and demo, with the ROS 2 fields arriving already structured instead of parsed from text.
 - Windows/macOS: package is Linux-only; CMake guards accordingly.
 - Journal namespace management.
 
@@ -209,7 +213,7 @@ rcl_logging_journal/
 │   └── benchmark/               # Section 8 harness
 │       ├── bench_backend.cpp    # drives rcl_logging_external_* directly (dlopen)
 │       ├── CMakeLists.txt
-│       ├── run_matrix.sh        # spdlog vs syslog vs journald matrix
+│       ├── run_matrix.sh        # spdlog vs journald matrix
 │       └── report.py            # latency percentiles, CPU, bytes-on-disk -> markdown
 ├── src/
 │   └── rcl_logging_journal.cpp
@@ -234,22 +238,22 @@ rcl_logging_journal/
 | rcl_logging_interface | journald backend behavior |
 |---|---|
 | `rcl_logging_external_initialize(file_name_prefix, config_file, allocator)` | Validate the allocator. Idempotent when already initialized. Warn if a `config_file` is given (journald has no client side configuration file). Resolve `SYSLOG_IDENTIFIER`: `RCL_LOGGING_JOURNAL_IDENTIFIER`, else `file_name_prefix` (`--log-file-name`), else the executable name. Cache `ROS2_DISTRO` from `$ROS_DISTRO`. Parse and validate `RCL_LOGGING_JOURNAL_EXTRA_FIELDS`. Probe journald availability with `access("/run/systemd/journal/socket", W_OK)`. Return `RCL_LOGGING_RET_ERROR` with an actionable message if unavailable in strict mode. No connection to hold: `sd_journal_sendv` manages its own socket. |
-| `rcl_logging_external_log(severity, name, msg)` | Map severity (4.3); drop if above the current threshold. Compose `MESSAGE=` and `ROS2_NODE_NAME=` in stack buffers, append the pre-built constant iovecs, call `sd_journal_sendv()` once. `name` may be NULL/empty (rcl logs some records with no logger): omit `ROS2_NODE_NAME`, keep `SYSLOG_IDENTIFIER`. Failures are counted, never retried or blocked on. |
-| `rcl_logging_external_set_logger_level(name, level)` | v1: single global threshold (matches `rcl_logging_syslog` behavior via `setlogmask` semantics). Stored in an atomic; `UNSET` disables backend filtering. A per-logger map is a possible v2 (rcl only invokes this for the default logger today). |
-| `rcl_logging_external_shutdown()` | Report the number of undeliverable records (if any) through rcutils logging, reset state. Nothing to flush: every `sd_journal_sendv` is a completed datagram; durability is journald's job (and immediate for CRIT+). |
+| `rcl_logging_external_log(severity, name, msg)` | Map severity (4.3). Copy `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` into the ring buffer under the producer mutex and return; the sender thread appends the pre-built constant iovecs and calls `sd_journal_sendv()` once per record. `name` may be NULL/empty (rcl logs some records with no logger): omit `ROS2_NODE_NAME`, keep `SYSLOG_IDENTIFIER`. FATAL waits until its record has been handed to journald. Records above 256 KiB drain the ring and are sent synchronously to keep ordering. Send failures are counted, never retried. |
+| `rcl_logging_external_set_logger_level(name, level)` | Accepted and ignored. rcl filters on the rcutils logger level before calling the backend, so a second threshold only costs time; storage side filtering is journald's `MaxLevelStore=`. Same split as `rcl_logging_syslog` and rsyslog. |
+| `rcl_logging_external_shutdown()` | Drain the ring (the sender thread is joined), report the number of undeliverable records (if any) through rcutils logging, reset state. Durability is journald's job (immediate for CRIT+). |
 
 ### 4.3 Severity mapping
 
-| RCUTILS severity | journald `PRIORITY` | journalctl `-p` name | `ROS2_SEVERITY` |
-|---|---|---|---|
-| `DEBUG (10)` | 7 `LOG_DEBUG` | debug | `DEBUG` |
-| `INFO (20)`  | 6 `LOG_INFO` | info | `INFO` |
-| `WARN (30)`  | 4 `LOG_WARNING` | warning | `WARN` |
-| `ERROR (40)` | 3 `LOG_ERR` | err | `ERROR` |
-| `FATAL (50)` | 2 `LOG_CRIT` | crit | `FATAL` |
-| `UNSET/other` | 6 `LOG_INFO` | info | `UNSET` |
+| RCUTILS severity | journald `PRIORITY` | journalctl `-p` name |
+|---|---|---|
+| `DEBUG (10)` | 7 `LOG_DEBUG` | debug |
+| `INFO (20)`  | 6 `LOG_INFO` | info |
+| `WARN (30)`  | 4 `LOG_WARNING` | warning |
+| `ERROR (40)` | 3 `LOG_ERR` | err |
+| `FATAL (50)` | 2 `LOG_CRIT` | crit |
+| `UNSET/other` | 6 `LOG_INFO` | info |
 
-Filtering compares journald priorities: a record passes when its priority is numerically less than or equal to the threshold derived from `set_logger_level()` (`UNSET` level means "everything").
+`PRIORITY` is the only severity field; a separate `ROS2_SEVERITY` with the ROS wording was dropped because `journalctl -p` already covers every query and each extra field costs journald a hash lookup per record. The backend does not filter: rcl filters on the logger level before it is called, journald filters at storage time with `MaxLevelStore=`.
 
 Note: mapping FATAL to `LOG_CRIT` means journald **fsyncs immediately** on FATAL, free crash-durability for the records you care most about.
 
@@ -272,8 +276,7 @@ Every record sent via one `sd_journal_sendv()` call:
 
 ```
 MESSAGE=<msg as received from rcl (already includes rcutils-formatted content)>
-PRIORITY=<mapped severity>
-ROS2_SEVERITY=<DEBUG|INFO|WARN|ERROR|FATAL|UNSET>   # original ROS wording, indexed
+PRIORITY=<mapped severity>              # journalctl -p
 ROS2_NODE_NAME=<logger name>            # primary filtering key (omitted if unset)
 SYSLOG_IDENTIFIER=<identifier>          # journalctl -t compatibility
 ROS2_DISTRO=<$ROS_DISTRO if set>
@@ -294,11 +297,18 @@ Field-name rationale: `ROS2_*` prefix avoids collision with journald's reserved 
 
 ### 4.7 Implementation notes (`src/rcl_logging_journal.cpp`)
 
-- Constant fields (`SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, extra fields) are composed once at initialization into owning `std::string`s plus a pre-built `struct iovec` array.
-- `PRIORITY=n` and `ROS2_SEVERITY=x` are compile time string literals selected by a `switch` on the severity, no formatting at all on the hot path.
-- `MESSAGE=` and `ROS2_NODE_NAME=` are composed with `memcpy` into stack buffers (4 KiB and 512 B) with a heap fallback for larger values.
-- Per call work is therefore: threshold check, two `memcpy`s, one `memcpy` of the constant iovecs, one `sd_journal_sendv()` (one `sendmsg`).
-- `sd_journal_sendv()` is used instead of the printf-style `sd_journal_send()` to avoid the `vasprintf` per field that the latter performs.
+Measured on a desktop (systemd 259, see 2.3), one `sd_journal_sendv()` costs about 6.5 µs and a raw `sendmsg()` on the native socket costs the same, so the cost is the kernel handoff and journald wake up, not libsystemd. The backend therefore never issues that syscall from the caller's thread:
+
+- **Ring buffer.** A 1 MiB byte ring allocated at initialization (pages are touched lazily). A record slot is an 8 byte header (`total_len`, kind, priority, `name_field_len`) followed by the complete `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` buffers, 8 byte aligned. A pad slot fills the tail when a record does not fit contiguously.
+- **Producers** (any thread calling `rcl_logging_external_log`) take one mutex, `memcpy` the record, advance the tail, and return. The mutex is uncontended in the common case and never held across a syscall. When the ring is full the producer waits for space: nothing is dropped, the call degrades to the synchronous cost.
+- **Consumer**: one thread per process (`rcl_journal` in `ps -T`). It reads the header under the mutex, releases it, and calls `sd_journal_sendv()` with iovecs pointing straight into the ring (no copy), then advances the head. Since it is the only sender, records reach journald in enqueue order, including across threads.
+- **FATAL** (`LOG_CRIT`) callers wait on a sequence number until the consumer has sent their record; journald fsyncs `CRIT` and above immediately, so a FATAL followed by `abort()` is on disk.
+- **Large records** above 256 KiB do not fit the ring comfortably: the producer drains the ring first (ordering) and sends synchronously; libsystemd uses a sealed memfd for them.
+- **Shutdown / exit** destroy the sender, which drains and joins. A `pthread_atfork` child handler switches a forked child to synchronous sends, since the thread does not exist there.
+- `PRIORITY=n` is a compile time string literal selected by index; constant fields (`SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, extra fields) are composed once into owning `std::string`s plus a pre-built `struct iovec` array.
+- `sd_journal_sendv()` is used instead of the printf-style `sd_journal_send()` to avoid a `vasprintf` per field on the consumer.
+
+What this does not change: the sustained throughput ceiling is journald's (about 6 to 8 µs of daemon CPU per record on the same desktop, plus its rate limit). A burst of a few thousand records is absorbed by the ring at `memcpy` cost; a node that logs faster than journald ingests for longer than the ring covers is throttled to journald's rate, as before.
 
 ### 4.8 `package.xml` / `CMakeLists.txt`
 
@@ -346,8 +356,8 @@ Same philosophy as `rcl_logging_syslog`'s colcon test (which writes via the back
 
 1. `rcl_logging_external_initialize()` returns OK when journald is present (CI containers run `systemd-journald` standalone; see 6). Invalid and failing allocators are rejected.
 2. Log a set of unique, PID and random token tagged messages at each severity through `rcl_logging_external_log()`, using a unique logger name per test.
-3. Read back via the **`sd_journal` read API** (`sd_journal_open` + `sd_journal_add_match("ROS2_NODE_NAME=<token>")`), asserting: message content, `PRIORITY` mapping, `ROS2_SEVERITY`, presence of `ROS2_NODE_NAME`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, absence of `CODE_*`, and journald's trusted `_PID` / `_TRANSPORT=journal`.
-4. Severity threshold test: for every (level, severity) pair, assert exactly the expected subset is stored.
+3. Read back via the **`sd_journal` read API** (`sd_journal_open` + `sd_journal_add_match("ROS2_NODE_NAME=<token>")`), asserting: message content, `PRIORITY` mapping, presence of `ROS2_NODE_NAME`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, absence of `CODE_*`, and journald's trusted `_PID` / `_TRANSPORT=journal`.
+4. Level test: for every (level, severity) pair, `set_logger_level()` is accepted and every record is stored (the backend does not filter). Additional tests cover draining 20k records through the ring at shutdown, ordering across four producer threads, and the synchronous FATAL guarantee.
 5. Records without a logger name are stored without `ROS2_NODE_NAME`.
 6. `SYSLOG_IDENTIFIER` precedence: env override, `--log-file-name` prefix, executable name.
 7. Extra fields are stored and indexed; invalid extra fields fail initialization.
@@ -407,7 +417,7 @@ Same publishing flow as the syslog repo (marp markdown, HTML deck viewable via r
 4. `rcl_logging_journal` architecture diagram
 5. Demo: per-node journalctl filtering; container to host journal
 6. Performance: benchmark methodology + measured results (from Section 8)
-7. Positioning vs `rcl_logging_syslog` (complementary: syslog backend when you want rsyslog pipelines/FluentBit; journald backend when you want local observability with zero config)
+7. Positioning vs `rcl_logging_syslog`: the major difference is that developers can use `journalctl` on the system managed storage without managing log files at all; FluentBit/Fluentd forwarding is planned to be supported the same way as in `rcl_logging_syslog`
 
 ### 7.4 design docs
 
@@ -424,12 +434,12 @@ Goal: replace the "binary should be faster" assumption with reproducible numbers
 | ID | Question | Method | Metrics |
 |---|---|---|---|
 | B1 | Client call cost | 1 M calls/backend, msg sizes 64 B / 256 B / 4 KiB, severities INFO & FATAL | p50/p95/p99/p99.9 latency per `rcl_logging_external_log`, calls/sec |
-| B2 | System cost per record | 100 k msgs; app CPU from `getrusage`, daemon CPU (journald, rsyslogd) from `/proc/<pid>/stat` deltas | total CPU-ms per 1 k records |
+| B2 | System cost per record | 100 k msgs; app CPU from `getrusage`, `systemd-journald` CPU from `/proc/<pid>/stat` deltas | total CPU-ms per 1 k records |
 | B3 | Sustained throughput & loss | paced ramp 1 k to 200 k msg/s, 5 s each; count delivered records in the sink, journald `Suppressed N messages` | max lossless rate, suppressed count |
 | B4 | Storage footprint | identical 1 M-record workload (70 % 64 B INFO, 25 % 256 B INFO, 5 % 4 KiB WARN); `journalctl --disk-usage` vs text file sizes | bytes on disk, bytes per record |
-| B5 | Query performance | "get all WARN+ for logger X": `journalctl` match vs `grep` over text | wall time, first and second run |
+| B5 | Query performance | "get all WARN+ for logger X": `journalctl` match vs `grep` over the spdlog files | wall time, first and second run |
 
-Backends compared: `rcl_logging_spdlog` (baseline), `rcl_logging_syslog` (+rsyslogd file sink), `rcl_logging_journal` (this work). Environment recorded in `environment.txt` (CPU, governor, systemd version, effective `journald.conf`); `report.py` emits the markdown tables committed to `doc/`.
+Backends compared: `rcl_logging_spdlog` (the ROS 2 default, baseline) and `rcl_logging_journal` (this work). `rcl_logging_syslog` is intentionally left out; its performance evaluation belongs to that repository. The driver is generic (`dlopen` of any `librcl_logging_<name>.so`), so other backends can be added locally through `BACKENDS`. Environment recorded in `environment.txt` (CPU, governor, systemd version, effective `journald.conf`); `report.py` emits the markdown tables committed to `doc/`.
 
 ---
 
@@ -451,11 +461,11 @@ Backends compared: `rcl_logging_spdlog` (baseline), `rcl_logging_syslog` (+rsysl
 | Risk / question | Mitigation / decision |
 |---|---|
 | journald rate limiting silently drops bursts from chatty nodes | Documented prominently; drop-in config shipped; B3 quantifies limits; `sd_journal_sendv` errors are counted and reported at shutdown |
-| Ingestion throughput ceiling below tuned rsyslog for extreme rates | Honest positioning: journald backend targets observability/usability; B3 publishes the crossover so users choose informed |
+| Ingestion throughput ceiling at extreme rates (journald rate limits, single daemon) | Honest positioning: the journald backend's main benefit is `journalctl` over system managed storage; B3 publishes where suppression starts so users choose informed |
 | Non-systemd targets (Alpine images, RTOS-adjacent) | strict/non-strict init modes; README states Linux+systemd requirement upfront |
 | Logger name vs node name mismatch (logger names can be hierarchical / non-node) | Field named `ROS2_NODE_NAME` for discoverability but documented as "rcutils logger name"; a `ROS2_LOGGER_NAME` alias field can be added later without breaking queries |
-| Per-logger severity: interface currently gives the backend limited use of `set_logger_level` | v1 global threshold (parity with syslog backend); revisit if `rcl_logging_interface` evolves |
-| `sd_journal_sendv` per-call socket overhead vs batched writers | B1 measures; pre-assembled iovecs already implemented |
+| `set_logger_level` is ignored by the backend | rcl filters before calling the backend and journald has `MaxLevelStore=`; a backend threshold would only duplicate work on the hot path |
+| `sd_journal_sendv` per-call socket overhead (about 6.5 µs measured) | Ring buffer plus sender thread takes the syscall off the caller (4.7); B1 reports sustained and burst latency separately |
 | Naming | **Decided: `rcl_logging_journal`** (not `rcl_logging_journald`). Named after the API/subsystem (sd-journal, "the journal"), consistent with `rcl_logging_syslog` (named after the syslog(3) API, not the rsyslogd daemon) and `rcl_logging_spdlog` (library name), and with other bindings (Python `systemd.journal`, Go `go-systemd/journal`). Search discoverability handled by "journald"/"systemd-journald" keywords in the package description, README, and repo topics |
 
 ---

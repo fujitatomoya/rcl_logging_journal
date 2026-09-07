@@ -20,7 +20,7 @@
   <text x="170" y="280" text-anchor="middle" fill="#2d3748">severity -> PRIORITY</text>
   <text x="170" y="300" text-anchor="middle" fill="#2d3748">logger name -> ROS2_NODE_NAME</text>
   <text x="170" y="320" text-anchor="middle" fill="#2d3748">extra fields, SYSLOG_IDENTIFIER</text>
-  <text x="170" y="340" text-anchor="middle" fill="#4a5568" font-size="12">sd_journal_sendv(): one datagram per record</text>
+  <text x="170" y="340" text-anchor="middle" fill="#4a5568" font-size="12">ring buffer + sender thread: sd_journal_sendv() off the caller</text>
 
   <line x1="170" y1="190" x2="170" y2="228" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -74,8 +74,8 @@
   <rect x="330" y="70" width="610" height="130" rx="10" fill="#fffff0" stroke="#b7791f" stroke-width="2"/>
   <text x="635" y="94" text-anchor="middle" font-weight="bold" fill="#744210">one record = indexed KEY=VALUE fields</text>
   <text x="350" y="118" font-family="monospace" font-size="12" fill="#2d3748">MESSAGE=[INFO] [1724869818.620827927] [talker]: Publishing: 'Hello World: 1'</text>
-  <text x="350" y="136" font-family="monospace" font-size="12" fill="#2d3748">PRIORITY=6   ROS2_SEVERITY=INFO   ROS2_NODE_NAME=talker   ROS2_DISTRO=rolling</text>
-  <text x="350" y="154" font-family="monospace" font-size="12" fill="#2d3748">SYSLOG_IDENTIFIER=talker   ROBOT_ID=amr-07   FLEET=tokyo   (extra fields)</text>
+  <text x="350" y="136" font-family="monospace" font-size="12" fill="#2d3748">PRIORITY=6   ROS2_NODE_NAME=talker   ROS2_DISTRO=rolling   SYSLOG_IDENTIFIER=talker</text>
+  <text x="350" y="154" font-family="monospace" font-size="12" fill="#2d3748">ROBOT_ID=amr-07   FLEET=tokyo   (extra fields from RCL_LOGGING_JOURNAL_EXTRA_FIELDS)</text>
   <text x="350" y="172" font-family="monospace" font-size="12" fill="#4a5568">_PID=31348 _UID=1000 _COMM=talker _EXE=... _BOOT_ID=... _HOSTNAME=...  (trusted, by journald)</text>
   <text x="350" y="190" font-size="11" fill="#744210">repeated values are stored once (field deduplication), large values are compressed</text>
 </svg>
