@@ -202,7 +202,8 @@ rcl_logging_journal/
 │   ├── overview.md              # marp slide deck source
 │   ├── overview.html            # rendered deck (raw.githack publishing flow)
 │   ├── images/
-│   │   └── architecture_overview.svg
+│   │   ├── architecture_overview.svg
+│   │   └── ring_buffer.svg      # 4.7.1, the hot path ring between producers and sender
 │   ├── presentation/            # conference/meetup decks
 │   └── tutorials/
 │       ├── Journalctl_Basics.md         # per-node filtering, priorities, JSON export, vacuum
@@ -237,8 +238,8 @@ rcl_logging_journal/
 
 | rcl_logging_interface | journald backend behavior |
 |---|---|
-| `rcl_logging_external_initialize(file_name_prefix, config_file, allocator)` | Validate the allocator. Idempotent when already initialized. Warn if a `config_file` is given (journald has no client side configuration file). Resolve `SYSLOG_IDENTIFIER`: `RCL_LOGGING_JOURNAL_IDENTIFIER`, else `file_name_prefix` (`--log-file-name`), else the executable name. Cache `ROS2_DISTRO` from `$ROS_DISTRO`. Parse and validate `RCL_LOGGING_JOURNAL_EXTRA_FIELDS`. Probe journald availability with `access("/run/systemd/journal/socket", W_OK)`. Return `RCL_LOGGING_RET_ERROR` with an actionable message if unavailable in strict mode. No connection to hold: `sd_journal_sendv` manages its own socket. |
-| `rcl_logging_external_log(severity, name, msg)` | Map severity (4.3). Copy `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` into the ring buffer under the producer mutex and return; the sender thread appends the pre-built constant iovecs and calls `sd_journal_sendv()` once per record. `name` may be NULL/empty (rcl logs some records with no logger): omit `ROS2_NODE_NAME`, keep `SYSLOG_IDENTIFIER`. FATAL waits until its record has been handed to journald. Records above 256 KiB drain the ring and are sent synchronously to keep ordering. Send failures are counted, never retried. |
+| `rcl_logging_external_initialize(file_name_prefix, config_file, allocator)` | Validate the allocator. Idempotent when already initialized. Warn if a `config_file` is given (journald has no client side configuration file). Resolve `SYSLOG_IDENTIFIER`: `RCL_LOGGING_JOURNAL_IDENTIFIER`, else `file_name_prefix` (`--log-file-name`), else the executable name. Cache `ROS2_DISTRO` from `$ROS_DISTRO`. Parse and validate `RCL_LOGGING_JOURNAL_EXTRA_FIELDS`. Parse `RCL_LOGGING_JOURNAL_BUFFER_SIZE` and allocate the ring buffer (4.7.1). Probe journald availability with `access("/run/systemd/journal/socket", W_OK)`. Return `RCL_LOGGING_RET_ERROR` with an actionable message if unavailable in strict mode. No connection to hold: `sd_journal_sendv` manages its own socket. |
+| `rcl_logging_external_log(severity, name, msg)` | Map severity (4.3). Copy `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` into the ring buffer under the producer mutex and return; the sender thread appends the pre-built constant iovecs and calls `sd_journal_sendv()` once per record. `name` may be NULL/empty (rcl logs some records with no logger): omit `ROS2_NODE_NAME`, keep `SYSLOG_IDENTIFIER`. FATAL waits until its record has been handed to journald. Records above a quarter of the ring (256 KiB by default) drain the ring and are sent synchronously to keep ordering. Send failures are counted, never retried. |
 | `rcl_logging_external_set_logger_level(name, level)` | Accepted and ignored. rcl filters on the rcutils logger level before calling the backend, so a second threshold only costs time; storage side filtering is journald's `MaxLevelStore=`. Same split as `rcl_logging_syslog` and rsyslog. |
 | `rcl_logging_external_shutdown()` | Drain the ring (the sender thread is joined), report the number of undeliverable records (if any) through rcutils logging, reset state. Durability is journald's job (immediate for CRIT+). |
 
@@ -267,6 +268,7 @@ Following the `RCL_LOGGING_SYSLOG_FACILITY` precedent: env-only, sane defaults:
 | `RCL_LOGGING_JOURNAL_EXTRA_FIELDS` | *(empty)* | `;`-separated static `KEY=VALUE` pairs attached to every record (e.g. `ROBOT_ID=amr-07;FLEET=tokyo`), fully indexed, enables fleet-level `journalctl` queries. Keys must follow journald rules (`[A-Z0-9_]`, no leading `_`, at most 64 characters), must not collide with fields set by the backend, at most 32 entries. Invalid input fails initialization with `RCL_LOGGING_RET_INVALID_ARGUMENT`. |
 | `RCL_LOGGING_JOURNAL_STRICT` | `1` | `1`: fail init when journald socket is absent. `0`: init succeeds, backend becomes no-op (stderr/rosout continue to work via rcl's other output flags) |
 | `RCL_LOGGING_JOURNAL_SOCKET_PATH` | `/run/systemd/journal/socket` | path probed at initialization to decide whether journald is available. Diagnostic/testing knob: libsystemd itself always sends to the default path. |
+| `RCL_LOGGING_JOURNAL_BUFFER_SIZE` | `1M` (1 MiB) | capacity of the ring buffer between the logging threads and the sender thread (4.7.1). A decimal byte count with an optional `K`, `M` or `G` suffix (powers of 1024), from `4K` to `1G`, rounded up to a multiple of 8. Records larger than a quarter of the capacity bypass the ring and are sent synchronously. Invalid values fail initialization with `RCL_LOGGING_RET_INVALID_ARGUMENT`. Sizing guidance in 4.7.1. |
 
 Deliberately **no** option that duplicates journald's own knobs (rotation, compression, rate limits); those belong in `journald.conf`, and the `config/ros2-journald.conf` drop-in documents recommended robot settings.
 
@@ -299,16 +301,97 @@ Field-name rationale: `ROS2_*` prefix avoids collision with journald's reserved 
 
 Measured on a desktop (systemd 259, see 2.3), one `sd_journal_sendv()` costs about 6.5 µs and a raw `sendmsg()` on the native socket costs the same, so the cost is the kernel handoff and journald wake up, not libsystemd. The backend therefore never issues that syscall from the caller's thread:
 
-- **Ring buffer.** A 1 MiB byte ring allocated at initialization (pages are touched lazily). A record slot is an 8 byte header (`total_len`, kind, priority, `name_field_len`) followed by the complete `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` buffers, 8 byte aligned. A pad slot fills the tail when a record does not fit contiguously.
+- **Ring buffer.** A byte ring allocated at initialization, 1 MiB unless `RCL_LOGGING_JOURNAL_BUFFER_SIZE` says otherwise (pages are touched lazily). A record slot is an 8 byte header (`total_len`, kind, priority, `name_field_len`) followed by the complete `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` buffers, 8 byte aligned. A pad slot fills the tail when a record does not fit contiguously. Section 4.7.1 walks through it.
 - **Producers** (any thread calling `rcl_logging_external_log`) take one mutex, `memcpy` the record, advance the tail, and return. The mutex is uncontended in the common case and never held across a syscall. When the ring is full the producer waits for space: nothing is dropped, the call degrades to the synchronous cost.
 - **Consumer**: one thread per process (`rcl_journal` in `ps -T`). It reads the header under the mutex, releases it, and calls `sd_journal_sendv()` with iovecs pointing straight into the ring (no copy), then advances the head. Since it is the only sender, records reach journald in enqueue order, including across threads.
 - **FATAL** (`LOG_CRIT`) callers wait on a sequence number until the consumer has sent their record; journald fsyncs `CRIT` and above immediately, so a FATAL followed by `abort()` is on disk.
-- **Large records** above 256 KiB do not fit the ring comfortably: the producer drains the ring first (ordering) and sends synchronously; libsystemd uses a sealed memfd for them.
+- **Large records** above a quarter of the ring (256 KiB by default) do not fit the ring comfortably: the producer drains the ring first (ordering) and sends synchronously; libsystemd uses a sealed memfd for them.
 - **Shutdown / exit** destroy the sender, which drains and joins. A `pthread_atfork` child handler switches a forked child to synchronous sends, since the thread does not exist there.
 - `PRIORITY=n` is a compile time string literal selected by index; constant fields (`SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, extra fields) are composed once into owning `std::string`s plus a pre-built `struct iovec` array.
 - `sd_journal_sendv()` is used instead of the printf-style `sd_journal_send()` to avoid a `vasprintf` per field on the consumer.
 
 What this does not change: the sustained throughput ceiling is journald's (about 6 to 8 µs of daemon CPU per record on the same desktop, plus its rate limit). A burst of a few thousand records is absorbed by the ring at `memcpy` cost; a node that logs faster than journald ingests for longer than the ring covers is throttled to journald's rate, as before.
+
+#### 4.7.1 The ring buffer, step by step
+
+![ring buffer between the logging threads and the sender thread](./images/ring_buffer.svg)
+
+The ring is one `char` array of `capacity` bytes with three counters, all guarded by a single mutex: `tail_` (where the next producer writes), `head_` (where the consumer reads next) and `used_` (bytes committed, pad slots included). There is no per-record allocation and no linked list; a record *is* its bytes in the array.
+
+**One slot.** Every record occupies a contiguous, 8 byte aligned slot:
+
+```
++------------------------------------+--------------------------+---------------------------+-----+
+| RecordHeader, 8 bytes              | ROS2_NODE_NAME=<name>    | MESSAGE=<msg>             | pad |
+| total_len u32 | kind u8            | name_field_len bytes     | total_len - 8             | 0-7 |
+| priority u8   | name_field_len u16 | (0 when no logger name)  |   - name_field_len bytes  |  B  |
++------------------------------------+--------------------------+---------------------------+-----+
+<------------------------------ advance = round_up(total_len, 8) ------------------------------->
+```
+
+The two fields are stored as complete `KEY=VALUE` strings, so the consumer can point its iovecs straight into the ring; the header carries just enough (`priority`, `name_field_len`) to rebuild the iovec array without parsing. A slot never straddles the end of the array: when the record does not fit before the end, the producer writes a header only slot with `kind = pad` and `total_len` equal to the remaining bytes, then starts at offset 0.
+
+**Ring state.** Snapshot after five records, of which two have already been sent:
+
+```
+offset 0                                                                       capacity
++----------+-------------------+----------+----------+---------------+---------------+
+| R5       |       free        | R2       | R3       | R4            | pad           |
+| newest   | (R0, R1 sent)     | sending  | queued   | queued        | R5 did not fit|
++----------+-------------------+----------+----------+---------------+---------------+
+           ^                   ^                                                     |
+           tail_               head_                     the consumer skips the pad --+
+           next write          next send                 and wraps to offset 0
+
+used_ = R2 + R3 + R4 + pad + R5          free = capacity - used_ (the gap from tail_ to head_)
+```
+
+**Life of one record.**
+
+```
+producer (any logging thread)                        consumer ("rcl_journal" thread)
+-----------------------------                        --------------------------------
+rcl_logging_external_log(severity, name, msg)
+  severity -> PRIORITY index (no formatting)
+  advance > capacity/4 ? -> flush(), send_direct()    (synchronous path, see below)
+  lock(mutex_)
+    reserve(advance): full? wait on cv_space_  <------ notify cv_space_ after each send
+    memcpy header, ROS2_NODE_NAME=, MESSAGE=
+    tail_ += advance (wrap to 0 at capacity)
+    used_ += advance
+    seq = ++enqueued_
+  unlock
+  notify cv_data_ if the consumer sleeps  ---------->  wake, lock(mutex_)
+  return (about 0.1 us in total)                         header = ring[head_]; pad? head_ = 0, retry
+                                                       unlock
+                                                       iov = {MESSAGE, PRIORITY=n, ROS2_NODE_NAME}
+                                                             + constant fields (identifier, distro,
+                                                               extra fields), all pointers, no copy
+                                                       sd_journal_sendv(iov)  (about 6.5 us)
+  FATAL only: wait on cv_sent_ until sent_ >= seq  <-- lock(mutex_)
+                                                         head_ += advance (wrap), used_ -= advance
+                                                         ++sent_
+                                                         notify cv_space_ / cv_sent_ if anyone waits
+                                                       unlock, loop
+```
+
+Why this is safe with a single mutex:
+
+- The consumer never holds the mutex across `sd_journal_sendv()`. Producers only ever write at `tail_` and `used_` accounts for the slot being sent, so nobody can overwrite `[head_, head_ + advance)` until the consumer moves `head_` after the send. The record is therefore sent directly from the ring, without a copy.
+- One consumer means one sender: records reach journald in commit order, across all producer threads. This is what the `concurrent_producers_keep_order` test asserts.
+- A full ring blocks the producer on `cv_space_` instead of dropping: the call temporarily costs what a synchronous send would. Nothing is lost while the process lives; `rcl_logging_external_shutdown()` and normal process exit drain the ring before returning. A `SIGKILL` or a crash loses what is still queued, except FATAL records, which the caller waits for.
+- FATAL uses the same queue, not a side channel: the producer remembers its sequence number and waits on `cv_sent_` until `sent_` reaches it. Ordering with earlier INFO records is kept, and journald fsyncs `CRIT` and above immediately.
+- Records above a quarter of the capacity do not go through the ring. The producer calls `flush()` (waits until everything already queued is sent, so ordering holds) and then `send_direct()` from its own thread; libsystemd hands journald a sealed memfd for payloads beyond the datagram size. A forked child has no consumer thread and always takes this synchronous path (`pthread_atfork` handler).
+
+**Sizing (`RCL_LOGGING_JOURNAL_BUFFER_SIZE`).** The capacity trades memory and loss-on-kill against how long a burst can be absorbed without blocking the caller. At 6.5 µs per record the consumer drains about 150 records per millisecond, so a ring of N records covers a burst that runs ahead of journald by N records; a typical record with a 100 byte message costs roughly 150 bytes in the ring.
+
+| capacity | records of ~150 B | when it makes sense |
+|---|---|---|
+| `4K` (minimum) | ~25 | memory constrained targets that only need the syscall off the caller; producers block on any real burst. Records above 1 KiB go synchronous. |
+| `1M` (default) | ~7000 | a burst of several thousand records (a parameter dump, a startup storm) is absorbed at `memcpy` cost; the consumer empties a full ring in about 50 ms. Only touched pages are resident, so an idle node pays a few KiB, not 1 MiB. |
+| `16M` and above | ~100k+ | many chatty nodes in one process, or a journald that is periodically stalled (rate limit, slow disk) and must not stall the control loop. The price: more records lost if the process is killed before the sender drains, and a larger synchronous threshold (capacity / 4). |
+
+The value is validated at initialization: `4K` to `1G`, decimal digits with an optional `K`/`M`/`G` suffix, rounded up to a multiple of 8. Anything else fails with `RCL_LOGGING_RET_INVALID_ARGUMENT` and an error message naming the variable.
 
 ### 4.8 `package.xml` / `CMakeLists.txt`
 
@@ -364,6 +447,7 @@ Same philosophy as `rcl_logging_syslog`'s colcon test (which writes via the back
 8. Strict-mode test: point `RCL_LOGGING_JOURNAL_SOCKET_PATH` at a nonexistent path, assert init failure with `STRICT=1` (error message names the path) and no-op success with `STRICT=0` (nothing stored).
 9. Fallback path test: log one 300 KiB message to exercise the memfd path and journald compression.
 10. Long hierarchical logger names (> 512 B) exercise the heap fallback.
+11. Buffer size: with `RCL_LOGGING_JOURNAL_BUFFER_SIZE=4K` (the minimum) 3000 records of varying length must all arrive in order, which wraps the ring hundreds of times, exercises pad slots at many offsets and blocks producers on a full ring; a record above capacity / 4 then takes the synchronous path and still lands last. Suffix and case variants are accepted; malformed, out of range and overflowing values fail initialization with `RCL_LOGGING_RET_INVALID_ARGUMENT`.
 
 Reading back with the same library we write with keeps the test hermetic (no dependency on `journalctl` output formatting), but one smoke test also shells out to `journalctl ROS2_NODE_NAME=<token> -o json` to guard the real user experience.
 
