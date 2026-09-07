@@ -1,0 +1,18 @@
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Changelog for package rcl_logging_journal
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+0.1.0 (unreleased)
+------------------
+* Initial implementation of the rcl_logging_interface on top of the
+  systemd-journald native protocol (sd_journal_sendv).
+* Structured record schema: MESSAGE, PRIORITY, SYSLOG_IDENTIFIER,
+  ROS2_NODE_NAME, ROS2_SEVERITY, ROS2_DISTRO and user defined extra fields.
+* Environment configuration: RCL_LOGGING_JOURNAL_IDENTIFIER,
+  RCL_LOGGING_JOURNAL_EXTRA_FIELDS, RCL_LOGGING_JOURNAL_STRICT.
+* gtest suite reading records back through the sd_journal API and journalctl.
+* GitHub workflows per distribution with a standalone journald in the container,
+  Mergify backports, codespell, stale and ABI checks.
+* Design document, journalctl / container / retention tutorials, overview deck.
+* Benchmark harness comparing spdlog, syslog and journald backends.
+* Contributors: Tomoya Fujita

@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rcl_logging_journal</name>
+  <version>0.1.0</version>
+  <description>
+    Implementation of rcl_logging API for a systemd-journald backend.
+    Log records are written with the native journal protocol (sd_journal_send)
+    as structured, indexed KEY=VALUE fields that can be queried with journalctl.
+  </description>
+
+  <maintainer email="tomoya.fujita825@gmail.com">Tomoya Fujita</maintainer>
+
+  <license>Apache License 2.0</license>
+
+  <url type="repository">https://github.com/fujitatomoya/rcl_logging_journal</url>
+  <url type="bugtracker">https://github.com/fujitatomoya/rcl_logging_journal/issues</url>
+
+  <author email="tomoya.fujita825@gmail.com">Tomoya Fujita</author>
+
+  <buildtool_depend>ament_cmake_ros</buildtool_depend>
+  <buildtool_depend>pkg-config</buildtool_depend>
+
+  <depend>rcl_logging_interface</depend>
+  <depend>rcpputils</depend>
+  <depend>rcutils</depend>
+
+  <!-- rosdep key for libsystemd headers and the .pc file (sd-journal.h). -->
+  <depend>libsystemd-dev</depend>
+
+  <!-- systemd-journald itself; on a stock systemd host it is already running. -->
+  <exec_depend>systemd</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>performance_test_fixture</test_depend>
+
+  <member_of_group>rcl_logging_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

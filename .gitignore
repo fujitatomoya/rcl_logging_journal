@@ -1,0 +1,5 @@
+gha-creds-*.json
+# benchmark harness output
+scripts/benchmark/results/
+scripts/benchmark/build/
+__pycache__/
