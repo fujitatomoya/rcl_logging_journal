@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="640" viewBox="0 0 980 640" font-family="Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <marker id="arrow-grey" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#718096"/>
+    </marker>
+  </defs>
+  <rect width="980" height="640" fill="#ffffff"/>
+  <text x="490" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#222">rcl_logging_journal: the ring buffer between the logging threads and the sender thread</text>
+
+  <!-- producers -->
+  <rect x="40" y="60" width="150" height="76" rx="10" fill="#e8f1fb" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="115" y="86" text-anchor="middle" font-weight="bold" fill="#1a365d">logging thread A</text>
+  <text x="115" y="106" text-anchor="middle" fill="#2d3748">RCLCPP_INFO(...)</text>
+  <text x="115" y="124" text-anchor="middle" font-size="11" fill="#4a5568">rcl_logging_external_log()</text>
+
+  <rect x="210" y="60" width="150" height="76" rx="10" fill="#e8f1fb" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="285" y="86" text-anchor="middle" font-weight="bold" fill="#1a365d">logging thread B</text>
+  <text x="285" y="106" text-anchor="middle" fill="#2d3748">RCLCPP_WARN(...)</text>
+  <text x="285" y="124" text-anchor="middle" font-size="11" fill="#4a5568">rcl_logging_external_log()</text>
+
+  <rect x="380" y="60" width="150" height="76" rx="10" fill="#e8f1fb" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="455" y="86" text-anchor="middle" font-weight="bold" fill="#1a365d">logging thread C</text>
+  <text x="455" y="106" text-anchor="middle" fill="#2d3748">RCLCPP_FATAL(...)</text>
+  <text x="455" y="124" text-anchor="middle" font-size="11" fill="#4a5568">rcl_logging_external_log()</text>
+
+  <!-- producer explanation -->
+  <rect x="560" y="60" width="380" height="76" rx="10" fill="#e8f1fb" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="750" y="80" text-anchor="middle" font-weight="bold" fill="#1a365d">producer side: any thread, same code path</text>
+  <text x="750" y="98" text-anchor="middle" fill="#2d3748">lock mutex_, reserve(advance), memcpy header + fields,</text>
+  <text x="750" y="112" text-anchor="middle" fill="#2d3748">tail_ += advance, seq = ++enqueued_, unlock, return.</text>
+  <text x="750" y="128" text-anchor="middle" font-size="11" fill="#4a5568">one memcpy, no syscall, no allocation, no formatting (about 0.1 us)</text>
+
+  <!-- producer arrows converge on tail_ -->
+  <line x1="115" y1="136" x2="150" y2="185" stroke="#444" stroke-width="2"/>
+  <line x1="285" y1="136" x2="150" y2="185" stroke="#444" stroke-width="2"/>
+  <line x1="455" y1="136" x2="150" y2="185" stroke="#444" stroke-width="2"/>
+  <line x1="150" y1="185" x2="150" y2="228" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="160" y="182" font-size="11" fill="#4a5568">memcpy under mutex_</text>
+
+  <!-- wrap arrow above the ring -->
+  <polyline points="935,228 935,205 45,205 45,226" fill="none" stroke="#718096" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-grey)"/>
+  <text x="930" y="199" text-anchor="end" font-size="11" fill="#4a5568">wrap: the pad slot is skipped, producer and consumer continue at offset 0</text>
+
+  <!-- ring segments -->
+  <rect x="40" y="230" width="110" height="60" fill="#fff5e6" stroke="#c05621" stroke-width="1"/>
+  <text x="95" y="256" text-anchor="middle" font-weight="bold" fill="#7b341e">R5</text>
+  <text x="95" y="274" text-anchor="middle" font-size="11" fill="#4a5568">newest</text>
+
+  <rect x="150" y="230" width="180" height="60" fill="#f7fafc" stroke="#a0aec0" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="240" y="256" text-anchor="middle" font-weight="bold" fill="#4a5568">free</text>
+  <text x="240" y="274" text-anchor="middle" font-size="11" fill="#4a5568">R0, R1 already sent</text>
+
+  <rect x="330" y="230" width="140" height="60" fill="#e6fffa" stroke="#2c7a7b" stroke-width="1"/>
+  <text x="400" y="256" text-anchor="middle" font-weight="bold" fill="#234e52">R2</text>
+  <text x="400" y="274" text-anchor="middle" font-size="11" fill="#4a5568">being sent</text>
+
+  <rect x="470" y="230" width="140" height="60" fill="#fff5e6" stroke="#c05621" stroke-width="1"/>
+  <text x="540" y="256" text-anchor="middle" font-weight="bold" fill="#7b341e">R3</text>
+  <text x="540" y="274" text-anchor="middle" font-size="11" fill="#4a5568">queued</text>
+
+  <rect x="610" y="230" width="230" height="60" fill="#fff5e6" stroke="#c05621" stroke-width="1"/>
+  <text x="725" y="256" text-anchor="middle" font-weight="bold" fill="#7b341e">R4</text>
+  <text x="725" y="274" text-anchor="middle" font-size="11" fill="#4a5568">queued (a long message)</text>
+
+  <rect x="840" y="230" width="100" height="60" fill="#edf2f7" stroke="#718096" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="890" y="256" text-anchor="middle" font-weight="bold" fill="#4a5568">pad</text>
+  <text x="890" y="274" text-anchor="middle" font-size="11" fill="#4a5568">R5 did not fit</text>
+
+  <rect x="40" y="230" width="900" height="60" fill="none" stroke="#444" stroke-width="2"/>
+
+  <!-- offsets and markers -->
+  <text x="42" y="304" font-size="11" fill="#4a5568">offset 0</text>
+  <text x="938" y="304" text-anchor="end" font-size="11" fill="#4a5568">offset capacity (1 MiB default, RCL_LOGGING_JOURNAL_BUFFER_SIZE)</text>
+
+  <line x1="150" y1="290" x2="150" y2="308" stroke="#c05621" stroke-width="2"/>
+  <text x="150" y="322" text-anchor="middle" font-size="11" font-weight="bold" fill="#7b341e">tail_</text>
+  <text x="150" y="335" text-anchor="middle" font-size="11" fill="#4a5568">next write</text>
+
+  <line x1="330" y1="290" x2="330" y2="308" stroke="#2c7a7b" stroke-width="2"/>
+  <text x="330" y="322" text-anchor="middle" font-size="11" font-weight="bold" fill="#234e52">head_</text>
+  <text x="330" y="335" text-anchor="middle" font-size="11" fill="#4a5568">next send</text>
+
+  <text x="925" y="322" text-anchor="end" font-size="11" fill="#4a5568">used_ = R2 + R3 + R4 + pad + R5 (committed bytes, pad included)</text>
+  <text x="925" y="335" text-anchor="end" font-size="11" fill="#4a5568">free = capacity - used_, always the gap from tail_ to head_</text>
+
+  <!-- consumer arrow -->
+  <line x1="400" y1="290" x2="598" y2="398" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="470" y="352" font-size="11" fill="#4a5568">iovecs point straight into the ring, no copy</text>
+
+  <!-- slot layout -->
+  <rect x="40" y="390" width="520" height="110" rx="10" fill="#fffff0" stroke="#b7791f" stroke-width="2"/>
+  <text x="300" y="410" text-anchor="middle" font-weight="bold" fill="#744210">one slot, 8 byte aligned: advance = round_up(total_len, 8)</text>
+  <text x="56" y="428" font-family="monospace" font-size="11" fill="#2d3748">header 8 B : total_len u32 | kind u8 | priority u8 | name_field_len u16</text>
+  <text x="56" y="442" font-family="monospace" font-size="11" fill="#2d3748">name field : ROS2_NODE_NAME=&lt;name&gt;   name_field_len bytes (0 when absent)</text>
+  <text x="56" y="456" font-family="monospace" font-size="11" fill="#2d3748">msg field  : MESSAGE=&lt;msg&gt;           total_len - 8 - name_field_len bytes</text>
+  <rect x="56" y="464" width="50" height="18" fill="#cbd5e0" stroke="#718096" stroke-width="1"/>
+  <text x="81" y="477" text-anchor="middle" font-size="10" fill="#2d3748">header</text>
+  <rect x="106" y="464" width="150" height="18" fill="#bee3f8" stroke="#2b6cb0" stroke-width="1"/>
+  <text x="181" y="477" text-anchor="middle" font-size="10" fill="#2d3748">ROS2_NODE_NAME=talker</text>
+  <rect x="256" y="464" width="250" height="18" fill="#fefcbf" stroke="#b7791f" stroke-width="1"/>
+  <text x="381" y="477" text-anchor="middle" font-size="10" fill="#2d3748">MESSAGE=[INFO] [1724869818.6] [talker]: Publishing ...</text>
+  <rect x="506" y="464" width="38" height="18" fill="#edf2f7" stroke="#718096" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="525" y="477" text-anchor="middle" font-size="10" fill="#4a5568">0..7 B</text>
+  <text x="300" y="495" text-anchor="middle" font-size="11" fill="#744210">a slot never straddles the end of the buffer: a header only pad slot (kind = pad) fills the gap</text>
+
+  <!-- consumer -->
+  <rect x="600" y="390" width="340" height="110" rx="10" fill="#e6fffa" stroke="#2c7a7b" stroke-width="2"/>
+  <text x="770" y="410" text-anchor="middle" font-weight="bold" fill="#234e52">sender thread "rcl_journal", one per process</text>
+  <text x="770" y="428" text-anchor="middle" font-size="11" fill="#2d3748">lock, read the header at head_ (pad? skip to 0), unlock</text>
+  <text x="770" y="442" text-anchor="middle" font-size="11" fill="#2d3748">iovec[]: MESSAGE, PRIORITY=n, ROS2_NODE_NAME from the ring</text>
+  <text x="770" y="456" text-anchor="middle" font-size="11" fill="#2d3748">+ prebuilt SYSLOG_IDENTIFIER, ROS2_DISTRO, extra fields</text>
+  <text x="770" y="470" text-anchor="middle" font-size="11" fill="#2d3748">sd_journal_sendv(): one sendmsg() per record (about 6.5 us)</text>
+  <text x="770" y="484" text-anchor="middle" font-size="11" fill="#2d3748">lock, head_ += advance, used_ -= advance, ++sent_,</text>
+  <text x="770" y="496" text-anchor="middle" font-size="11" fill="#2d3748">notify cv_space_ / cv_sent_ if anyone waits, unlock</text>
+
+  <line x1="835" y1="500" x2="835" y2="518" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- notes -->
+  <rect x="40" y="520" width="210" height="100" rx="10" fill="#fff5e6" stroke="#c05621" stroke-width="2"/>
+  <text x="145" y="538" text-anchor="middle" font-weight="bold" fill="#7b341e">ring full</text>
+  <text x="145" y="554" text-anchor="middle" font-size="11" fill="#2d3748">producer waits on cv_space_ until</text>
+  <text x="145" y="568" text-anchor="middle" font-size="11" fill="#2d3748">the sender frees room. Nothing is</text>
+  <text x="145" y="582" text-anchor="middle" font-size="11" fill="#2d3748">dropped, the call runs at journald's</text>
+  <text x="145" y="596" text-anchor="middle" font-size="11" fill="#2d3748">pace. shutdown and exit drain the</text>
+  <text x="145" y="610" text-anchor="middle" font-size="11" fill="#2d3748">ring; SIGKILL loses what is queued.</text>
+
+  <rect x="270" y="520" width="210" height="100" rx="10" fill="#fff5f5" stroke="#c53030" stroke-width="2"/>
+  <text x="375" y="538" text-anchor="middle" font-weight="bold" fill="#822727">FATAL (PRIORITY=2)</text>
+  <text x="375" y="554" text-anchor="middle" font-size="11" fill="#2d3748">producer keeps seq = ++enqueued_</text>
+  <text x="375" y="568" text-anchor="middle" font-size="11" fill="#2d3748">and waits on cv_sent_ until</text>
+  <text x="375" y="582" text-anchor="middle" font-size="11" fill="#2d3748">sent_ &gt;= seq. journald fsyncs CRIT</text>
+  <text x="375" y="596" text-anchor="middle" font-size="11" fill="#2d3748">and above at once, so FATAL then</text>
+  <text x="375" y="610" text-anchor="middle" font-size="11" fill="#2d3748">abort() is already on disk.</text>
+
+  <rect x="500" y="520" width="210" height="100" rx="10" fill="#faf5ff" stroke="#6b46c1" stroke-width="2"/>
+  <text x="605" y="538" text-anchor="middle" font-weight="bold" fill="#44337a">record &gt; capacity / 4</text>
+  <text x="605" y="554" text-anchor="middle" font-size="11" fill="#2d3748">(256 KiB with the default 1 MiB)</text>
+  <text x="605" y="568" text-anchor="middle" font-size="11" fill="#2d3748">flush() drains the ring, then</text>
+  <text x="605" y="582" text-anchor="middle" font-size="11" fill="#2d3748">send_direct() from the caller's</text>
+  <text x="605" y="596" text-anchor="middle" font-size="11" fill="#2d3748">thread; libsystemd hands journald</text>
+  <text x="605" y="610" text-anchor="middle" font-size="11" fill="#2d3748">a sealed memfd. Order is kept.</text>
+
+  <rect x="730" y="520" width="210" height="100" rx="10" fill="#e6fffa" stroke="#2c7a7b" stroke-width="2"/>
+  <text x="835" y="538" text-anchor="middle" font-weight="bold" fill="#234e52">systemd-journald</text>
+  <text x="835" y="554" text-anchor="middle" font-size="11" fill="#2d3748">/run/systemd/journal/socket</text>
+  <text x="835" y="568" text-anchor="middle" font-size="11" fill="#2d3748">AF_UNIX / SOCK_DGRAM</text>
+  <text x="835" y="582" text-anchor="middle" font-size="11" fill="#2d3748">adds trusted _PID, _COMM, _EXE ...</text>
+  <text x="835" y="596" text-anchor="middle" font-size="11" fill="#2d3748">rate limit, rotation, vacuum</text>
+  <text x="835" y="610" text-anchor="middle" font-size="11" fill="#2d3748">fsync at once for PRIORITY 2 and below</text>
+</svg>
