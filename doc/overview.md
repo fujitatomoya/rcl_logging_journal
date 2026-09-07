@@ -66,7 +66,7 @@ rcl_logging_syslog solved the transport problem. The consumption side stayed tex
 
 ```
 MESSAGE=[INFO] [1757236503.620] [talker]: Publishing: 'Hello World: 3'
-PRIORITY=6   ROS2_SEVERITY=INFO   ROS2_NODE_NAME=talker
+PRIORITY=6   ROS2_NODE_NAME=talker
 SYSLOG_IDENTIFIER=talker   ROS2_DISTRO=rolling   ROBOT_ID=amr-07
 ```
 
@@ -122,15 +122,16 @@ One backend, one socket, one daemon that is already running.
 | rcl_logging_interface | backend |
 |---|---|
 | `initialize` | resolve identifier, parse env, probe `/run/systemd/journal/socket`, pre-build constant fields |
-| `log(severity, name, msg)` | threshold check, `MESSAGE=` + `ROS2_NODE_NAME=` on the stack, one `sd_journal_sendv()` |
-| `set_logger_level` | global priority threshold (atomic) |
-| `shutdown` | nothing to flush, report undeliverable count |
+| `log(severity, name, msg)` | `memcpy` into a 1 MiB ring buffer, return; a sender thread does `sd_journal_sendv()` |
+| `set_logger_level` | ignored: rcl filters first, journald has `MaxLevelStore=` |
+| `shutdown` | drain the ring, report undeliverable count |
 
-- FATAL -> `LOG_CRIT`: journald fsyncs immediately, free crash durability.
-- No heap allocation up to 4 KiB messages, no locks, no printf on the hot path.
+- One `sendmsg()` to journald costs ~6.5 µs; a memcpy costs 0.01 µs. The caller pays the memcpy.
+- FATAL is synchronous: journald fsyncs `CRIT`, so FATAL + crash is on disk.
+- Order preserved (one consumer), nothing dropped (full ring blocks), exit drains.
 
 <!---
-sd_journal_sendv instead of sd_journal_send avoids a vasprintf per field.
+Same trade as rcl_logging_spdlog's buffered file sink. The ceiling stays journald's: ~6-8 us of daemon CPU per record, plus its rate limit.
 --->
 
 ---
@@ -197,7 +198,7 @@ The native socket, not /dev/log. Only libsystemd0 is needed in the image, which 
 - **Rate limiting**: 10000 msgs / 30 s per service by default, `Suppressed N messages`.
   Raise with `LogRateLimitBurst=` (unit) or `RateLimitBurst=` (global).
 - **No systemd** (Alpine, bare containers): strict init error, or `RCL_LOGGING_JOURNAL_STRICT=0`.
-- **Throughput**: rsyslog is tuned for raw ingestion; journald may saturate earlier at extreme rates.
+- **Throughput**: journald rate limits and may saturate at extreme rates; B3 shows where.
 - **Logger name != node name** for hierarchical loggers (`talker.child`).
 
 <!---
@@ -208,7 +209,7 @@ The benchmark harness quantifies the rate limit and the throughput crossover on 
 
 # Performance: measure, do not assume
 
-`scripts/benchmark/run_matrix.sh`, same driver for spdlog / syslog / journal:
+`scripts/benchmark/run_matrix.sh`, same driver for spdlog (baseline) and journal:
 
 | id | question | metric |
 |---|---|---|
@@ -231,12 +232,14 @@ Numbers depend on the host. Run it on the robot, publish REPORT.md.
 | record | text line | indexed fields |
 | daemons | journald + rsyslogd | journald |
 | setup | rsyslog conf, /var/log/ros | none |
-| strength | pipelines: FluentBit, Loki, remote syslog | local observability, `journalctl`, boots |
+| reading logs | files, `grep`, `less` | `journalctl` on system managed storage |
+| FluentBit / Fluentd | rsyslog forward | journald input (planned, same architecture) |
 
-Complementary, not competing. Same interface, same CI, same branches.
+- The major difference: developers do not manage logs at all, `journalctl` just works.
+- Forwarding pipelines are a temporary gap, not a design limit.
 
 <!---
-Want a log pipeline? syslog. Want journalctl on the robot? journal. Both can coexist via ForwardToSyslog.
+FluentBit has a systemd input, Fluentd has fluent-plugin-systemd. Both read the journal directly with the ROS 2 fields already structured. Same interface, same CI, same branches as rcl_logging_syslog.
 --->
 
 ---

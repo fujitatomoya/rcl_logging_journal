@@ -1,47 +1,53 @@
 #!/bin/bash
 #
 # run_matrix.sh: reproducible benchmark matrix for ROS 2 logging backends
-# (design.md, section 8). Compares rcl_logging_spdlog, rcl_logging_syslog and
+# (design.md, section 8). Compares rcl_logging_spdlog (the ROS 2 default) and
 # rcl_logging_journal with the same driver (bench_backend) and writes JSON
 # lines into a results directory that report.py turns into markdown tables.
+# Other backends (e.g. rcl_logging_syslog) benchmark themselves in their own
+# repository; the driver is generic, so BACKENDS can name any backend library.
 #
-#   B1  client call latency (p50/p95/p99, calls/sec) per size and severity
-#   B2  system CPU per record: app + journald (+ rsyslogd) CPU time
+#   B1  client call latency (p50/p95/p99, calls/sec) per size and severity,
+#       sustained (as fast as possible, throughput bound) and in bursts
+#       (B1_BURST calls every B1_GAP_MS ms, the shape of a real node)
+#   B2  system CPU per record: app + journald CPU time
 #   B3  sustained throughput ramp: delivered vs. sent, journald suppression
 #   B4  storage footprint on disk for an identical workload
 #   B5  query time: journalctl field match vs. grep over text logs
 #
 # Prerequisites
 #   - source a workspace where all backends to compare are built
-#     (librcl_logging_spdlog.so / librcl_logging_syslog.so / librcl_logging_journal.so
-#      in LD_LIBRARY_PATH)
-#   - systemd-journald running; for rcl_logging_syslog an rsyslogd with a file
-#     sink whose path is given in SYSLOG_FILE (see rcl_logging_syslog config)
+#     (librcl_logging_spdlog.so / librcl_logging_journal.so in LD_LIBRARY_PATH)
+#   - systemd-journald running
 #   - run as root (or a user allowed to read the journal and daemon CPU stats)
 #
 # Environment knobs (defaults in parentheses)
-#   BACKENDS   ("rcl_logging_spdlog rcl_logging_syslog rcl_logging_journal")
-#   COUNT      (1000000) records per B1 run
+#   BACKENDS   ("rcl_logging_spdlog rcl_logging_journal")
+#   COUNT      (1000000) records per sustained B1 run
+#   B1_BURST   (100) calls per burst in the burst B1 run, 0 disables it
+#   B1_GAP_MS  (10) pause between bursts in ms
+#   B1_BURSTS  (500) number of bursts per burst B1 run
 #   SIZES      ("64 256 4096") message sizes in bytes
 #   SEVERITIES ("INFO FATAL")
 #   B2_COUNT   (100000) records for the CPU accounting run
 #   B3_RATES   ("1000 5000 20000 50000 100000 200000") msg/s ramp, 5 s each
 #   B4_COUNT   (1000000) records for the storage footprint run
-#   SYSLOG_FILE  path of the rsyslog file sink for the syslog backend
 #   RESULTS    (scripts/benchmark/results/<timestamp>)
 #   SKIP       space separated list of benchmark ids to skip, e.g. "B3 B5"
 #
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKENDS="${BACKENDS:-rcl_logging_spdlog rcl_logging_syslog rcl_logging_journal}"
+BACKENDS="${BACKENDS:-rcl_logging_spdlog rcl_logging_journal}"
 COUNT="${COUNT:-1000000}"
+B1_BURST="${B1_BURST:-100}"
+B1_GAP_MS="${B1_GAP_MS:-10}"
+B1_BURSTS="${B1_BURSTS:-500}"
 SIZES="${SIZES:-64 256 4096}"
 SEVERITIES="${SEVERITIES:-INFO FATAL}"
 B2_COUNT="${B2_COUNT:-100000}"
 B3_RATES="${B3_RATES:-1000 5000 20000 50000 100000 200000}"
 B4_COUNT="${B4_COUNT:-1000000}"
-SYSLOG_FILE="${SYSLOG_FILE:-}"
 SKIP="${SKIP:-}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RESULTS="${RESULTS:-${HERE}/results/${STAMP}}"
@@ -67,18 +73,33 @@ skipped() { [[ " ${SKIP} " == *" $1 "* ]]; }
 log "results in ${RESULTS}"
 
 # ---------------------------------------------------------------- build driver
-if [ ! -x "${BENCH}" ] || [ "${HERE}/bench_backend.cpp" -nt "${BENCH}" ]; then
-  log "building bench_backend"
-  cmake -S "${HERE}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release > /dev/null
-  cmake --build "${BUILD_DIR}" > /dev/null
-fi
+# Always configure and build: the build is incremental and takes well under a
+# second when nothing changed, and a stale binary would silently skew results.
+log "building bench_backend"
+cmake -S "${HERE}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release > /dev/null
+cmake --build "${BUILD_DIR}" > /dev/null
 
+# ---------------------------------------------------------------- preflight
+# systemd-journald must already be running: the harness measures it, it does
+# not start it.
+preflight_failed=0
 for backend in ${BACKENDS}; do
   if ! ldconfig -p 2>/dev/null | grep -q "lib${backend}.so" && \
      ! (IFS=:; for d in ${LD_LIBRARY_PATH:-}; do [ -e "$d/lib${backend}.so" ] && exit 0; done; exit 1); then
-    log "WARNING: lib${backend}.so not found in LD_LIBRARY_PATH; did you source the workspace?"
+    log "ERROR: lib${backend}.so not found in LD_LIBRARY_PATH; source the workspace first"
+    preflight_failed=1
+  fi
+  if [ "${backend}" = "rcl_logging_journal" ]; then
+    if [ -z "$(pidof systemd-journald || true)" ] || [ ! -S /run/systemd/journal/socket ]; then
+      log "ERROR: systemd-journald is not running (needed by rcl_logging_journal)"
+      preflight_failed=1
+    fi
   fi
 done
+if [ "${preflight_failed}" -ne 0 ]; then
+  log "preflight failed, aborting (drop a backend from BACKENDS to skip it)"
+  exit 1
+fi
 
 # ---------------------------------------------------------------- helpers
 # CPU ticks (user+system) of a process from /proc, in clock ticks.
@@ -91,7 +112,6 @@ CLK_TCK="$(getconf CLK_TCK)"
 daemon_pids() {
   case "$1" in
     rcl_logging_journal) pidof systemd-journald || true ;;
-    rcl_logging_syslog) { pidof systemd-journald; pidof rsyslogd; } 2>/dev/null | xargs || true ;;
     *) ;;
   esac
 }
@@ -102,7 +122,6 @@ spdlog_dir() { echo "${ROS_LOG_DIR:-${ROS_HOME:-$HOME/.ros}/log}"; }
 disk_bytes() {
   case "$1" in
     rcl_logging_journal) du -sb /var/log/journal /run/log/journal 2>/dev/null | awk '{s+=$1} END {print s+0}' ;;
-    rcl_logging_syslog) { [ -n "${SYSLOG_FILE}" ] && stat -c %s "${SYSLOG_FILE}" 2>/dev/null; } || echo 0 ;;
     rcl_logging_spdlog) du -sb "$(spdlog_dir)" 2>/dev/null | awk '{print $1+0}' ;;
   esac
 }
@@ -110,7 +129,6 @@ delivered_records() {
   # $1 backend, $2 logger name token. grep -c exits 1 on zero matches.
   case "$1" in
     rcl_logging_journal) { journalctl -q -o cat "ROS2_NODE_NAME=$2" 2>/dev/null || true; } | wc -l ;;
-    rcl_logging_syslog) { [ -n "${SYSLOG_FILE}" ] && grep -c "\[$2\]" "${SYSLOG_FILE}" 2>/dev/null; } || echo 0 ;;
     rcl_logging_spdlog) { cat "$(spdlog_dir)"/bench_backend_*.log 2>/dev/null || true; } | { grep -c "\[$2\]" || true; } ;;
   esac
 }
@@ -133,6 +151,16 @@ if ! skipped B1; then
       done
     done
   done
+  if [ "${B1_BURST}" -gt 0 ]; then
+    for backend in ${BACKENDS}; do
+      for size in ${SIZES}; do
+        log "  ${backend} size=${size} burst=${B1_BURST} gap=${B1_GAP_MS}ms x${B1_BURSTS}"
+        "${BENCH}" --backend "${backend}" --count "$(( B1_BURST * B1_BURSTS ))" --size "${size}" \
+          --severity INFO --burst "${B1_BURST}" --gap-ms "${B1_GAP_MS}" \
+          --logger-name "b1_${STAMP}" >> "${RESULTS}/b1.jsonl"
+      done
+    done
+  fi
 fi
 
 # ---------------------------------------------------------------- B2 system CPU
@@ -203,10 +231,6 @@ if ! skipped B5; then
       rcl_logging_journal)
         cold="$(time_ms journalctl -q -p warning "ROS2_NODE_NAME=${token}" -o cat)"
         warm="$(time_ms journalctl -q -p warning "ROS2_NODE_NAME=${token}" -o cat)" ;;
-      rcl_logging_syslog)
-        [ -n "${SYSLOG_FILE}" ] || { echo "{\"backend\":\"${backend}\",\"skipped\":\"SYSLOG_FILE not set\"}" >> "${RESULTS}/b5.jsonl"; continue; }
-        cold="$(time_ms grep -E "\[(WARN|ERROR|FATAL)\] .*\[${token}\]" "${SYSLOG_FILE}")"
-        warm="$(time_ms grep -E "\[(WARN|ERROR|FATAL)\] .*\[${token}\]" "${SYSLOG_FILE}")" ;;
       rcl_logging_spdlog)
         cold="$(time_ms grep -rE "\[(WARN|ERROR|FATAL)\] .*\[${token}\]" "$(spdlog_dir)")"
         warm="$(time_ms grep -rE "\[(WARN|ERROR|FATAL)\] .*\[${token}\]" "$(spdlog_dir)")" ;;

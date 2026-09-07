@@ -19,13 +19,15 @@ ROS 2 ships no tool to *consume* its logs. The default `rcl_logging_spdlog` back
 
 Linux already has that tool: [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html). `rcl_logging_journal` makes ROS 2 log records first class journal entries:
 
-- every record carries indexed fields (`ROS2_NODE_NAME`, `PRIORITY`, `ROS2_SEVERITY`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, your own fleet fields), so `journalctl ROS2_NODE_NAME=talker` is an index lookup, not a text scan;
+- every record carries indexed fields (`ROS2_NODE_NAME`, `PRIORITY`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, your own fleet fields), so `journalctl ROS2_NODE_NAME=talker` is an index lookup, not a text scan;
 - journald adds **trusted** metadata (`_PID`, `_UID`, `_COMM`, `_EXE`, `_BOOT_ID`, `_HOSTNAME`) from kernel credentials, nothing the client can spoof;
 - rotation, size and time based retention, vacuuming, compression and field deduplication are built in and configured once in `journald.conf(5)`;
 - `journalctl -b -1` shows the previous boot, JSON export is one flag away, and the same files can be shipped to a fleet collector with `systemd-journal-remote`;
 - containers log into the **host** journal by binding one socket, no daemon inside the image.
 
-Compared with [rcl_logging_syslog](https://github.com/fujitatomoya/rcl_logging_syslog), which routes ROS 2 logs into rsyslog pipelines (FluentBit, Loki, remote syslog), `rcl_logging_journal` targets **local observability with zero configuration**. The two are complementary: pick syslog when you want a log processing pipeline, pick journal when you want `journalctl` on the robot. See [design.md](./doc/design.md#11-why-journald-and-not-only-syslog) for a feature by feature comparison.
+The major difference from [rcl_logging_syslog](https://github.com/fujitatomoya/rcl_logging_syslog) is on the consumption side: log records live in the system storage managed by journald, and developers can use standard utilities such as `journalctl` to see, filter and export them right away. There is no log directory to manage, no rotation to configure, nothing to clean up.
+
+The log pipeline capability of `rcl_logging_syslog` (rsyslog to [FluentBit](https://fluentbit.io/) / [Fluentd](https://www.fluentd.org/) / Loki / remote collectors) is not lost with journald. Both FluentBit ([systemd input](https://docs.fluentbit.io/manual/pipeline/inputs/systemd)) and Fluentd ([fluent-plugin-systemd](https://github.com/fluent-plugin-systemd/fluent-plugin-systemd)) read the journal directly, so the same architecture can be built on top of `rcl_logging_journal`, with the ROS 2 fields already structured instead of parsed from text. Forwarding is not covered in this version yet, that is a temporary limitation and it is planned to be supported just like in `rcl_logging_syslog`. See [design.md](./doc/design.md#11-why-journald-and-not-only-syslog) for a feature by feature comparison.
 
 ## Demonstration
 
@@ -60,7 +62,6 @@ Sun 2026-09-07 10:15:03.620812 JST [s=8a9b5ca9...;i=1a3;b=376ab38e...;m=f37f7688
     _MACHINE_ID=5e01c53d9dd64ba6b52d4a50543ef4e8
     _HOSTNAME=robot-07
     PRIORITY=6
-    ROS2_SEVERITY=INFO
     ROS2_NODE_NAME=talker
     SYSLOG_IDENTIFIER=talker
     ROS2_DISTRO=rolling
@@ -234,6 +235,8 @@ The backend itself is configured through environment variables only. Everything 
 | `RCL_LOGGING_JOURNAL_STRICT` | `1` | `1`: initialization fails with an actionable error when journald is not available. `0`: initialization succeeds and the backend becomes a no-op (rcl's stdout and rosout outputs keep working). |
 | `RCL_LOGGING_JOURNAL_SOCKET_PATH` | `/run/systemd/journal/socket` | Path probed at initialization to decide whether journald is available. Diagnostic/testing knob only; libsystemd always sends to the default path. |
 
+The backend does **not** filter by severity. rcl already filters on the logger level (`--ros-args --log-level`) before any backend is called, and journald can drop levels at the daemon with `MaxLevelStore=` in `journald.conf(5)`, the same split as `rcl_logging_syslog` with rsyslog. Everything that reaches the backend is stored.
+
 Examples:
 
 ```bash
@@ -249,8 +252,7 @@ Every ROS 2 log line becomes one journal entry with these fields (all indexed, a
 | field | value |
 | :---- | :---- |
 | `MESSAGE` | the formatted message as produced by rcl (`[INFO] [<stamp>] [<logger>]: <text>`) |
-| `PRIORITY` | `7` DEBUG, `6` INFO, `4` WARN, `3` ERROR, `2` FATAL (journald fsyncs `2` and below immediately) |
-| `ROS2_SEVERITY` | `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL` |
+| `PRIORITY` | `7` DEBUG, `6` INFO, `4` WARN, `3` ERROR, `2` FATAL (`journalctl -p warning` etc.; journald fsyncs `2` and below immediately) |
 | `ROS2_NODE_NAME` | the rcutils logger name (the node name for node loggers, hierarchical names such as `talker.child` for sub loggers); omitted when rcl logs without a logger name |
 | `SYSLOG_IDENTIFIER` | executable name unless overridden (`journalctl -t`) |
 | `ROS2_DISTRO` | `$ROS_DISTRO` when set |
@@ -298,20 +300,33 @@ journald drops records from a service that logs more than `RateLimitBurst` (defa
 
 ## Performance
 
-The backend hot path is: severity threshold check, `memcpy` of `MESSAGE=` and `ROS2_NODE_NAME=` into stack buffers, and one `sd_journal_sendv()` (one `sendmsg()` on an `AF_UNIX` datagram socket; records above the datagram limit go through a sealed memfd). `PRIORITY`, `ROS2_SEVERITY`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO` and extra fields are pre-built at initialization. There is no heap allocation for messages up to 4 KiB and no lock besides what libsystemd requires.
+`rcl_logging_external_log()` copies the record into a preallocated 1 MiB ring buffer under a mutex and returns; one sender thread per process drains the ring with `sd_journal_sendv()`. The caller therefore pays a `memcpy`, not the `sendmsg()` syscall and journald wake up (about 6 µs on a desktop, see below), which is the same trade `rcl_logging_spdlog` makes with its buffered file sink. Three things keep it safe:
 
-[scripts/benchmark](./scripts/benchmark) contains a reproducible harness that drives `rcl_logging_spdlog`, `rcl_logging_syslog` and `rcl_logging_journal` through the same `rcl_logging_interface` symbols and measures:
+- **FATAL is synchronous**: the call returns only after the record is in journald's hands, and journald fsyncs `CRIT` and above at once, so a FATAL followed by a crash is on disk.
+- **Order is preserved**: one consumer sends in enqueue order, also across threads. Records above 256 KiB bypass the ring after draining it.
+- **Nothing is dropped**: when journald is slower than the producers the ring fills and callers block, exactly like the synchronous version; `rcl_logging_external_shutdown()` (called by `rcl_shutdown`) and process exit drain the ring.
+
+`PRIORITY`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO` and extra fields are pre-built at initialization; there is no heap allocation, formatting, or filtering on the hot path.
+
+The ceiling is journald itself: it needs roughly 6 to 8 µs of CPU per record on a desktop and rate limits per service, so sustained rates above about 100k records/s per host back up regardless of the client. A ROS 2 node logs in bursts, which the ring absorbs; a node that logs at 100 kHz should not be logging.
+
+[scripts/benchmark](./scripts/benchmark) contains a reproducible harness that drives `rcl_logging_spdlog` (the ROS 2 default, used as the baseline) and `rcl_logging_journal` through the same `rcl_logging_interface` symbols and measures:
 
 - B1 client call latency (p50/p95/p99) per message size and severity,
-- B2 system CPU per record including the daemons,
+- B2 system CPU per record including `systemd-journald`,
 - B3 sustained throughput and journald suppression,
 - B4 bytes on disk for an identical workload,
-- B5 query time, `journalctl` field match vs `grep`.
+- B5 query time, `journalctl` field match vs `grep` over the spdlog files.
+
+Before starting, `systemd-journald` must already be running and both backend libraries must be sourced in the workspace (`rcl_logging_spdlog` comes with ROS 2). The harness measures the daemon, it does not start it, and it aborts with a message when a prerequisite is missing.
 
 ```bash
+systemctl status systemd-journald                 # active on any systemd host
 source <YOUR_WORKSPACE>/install/setup.bash
-sudo -E scripts/benchmark/run_matrix.sh      # results/<timestamp>/REPORT.md
+sudo -E scripts/benchmark/run_matrix.sh           # results/<timestamp>/REPORT.md
 ```
+
+Other backends are not part of this matrix; `rcl_logging_syslog` keeps its own performance evaluation in its repository. The driver itself is generic, so `BACKENDS` can name any `librcl_logging_<name>.so` if you want a local comparison.
 
 Measured numbers depend heavily on the host (disk, journald settings, kernel); run it on your target and read [design.md](./doc/design.md#23-honest-performance-expectations-what-to-verify-not-assume) for what to expect and why.
 

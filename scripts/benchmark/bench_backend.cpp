@@ -21,7 +21,12 @@
 // Usage:
 //   bench_backend --backend rcl_logging_journal [--count N] [--size BYTES]
 //                 [--severity DEBUG|INFO|WARN|ERROR|FATAL] [--rate MSG_PER_SEC]
-//                 [--logger-name NAME] [--warmup N]
+//                 [--burst N --gap-ms MS] [--logger-name NAME] [--warmup N]
+//
+// --rate paces single calls; --burst/--gap-ms issues N back to back calls,
+// then sleeps MS milliseconds, which is what a ROS 2 node with a periodic
+// callback that logs a few lines looks like. Without either option the calls
+// are issued as fast as possible (sustained, throughput bound).
 //
 // Output: one JSON object on stdout with latency percentiles (ns), throughput
 // and the CPU time consumed by this process.
@@ -64,6 +69,8 @@ struct Options
   int severity = RCUTILS_LOG_SEVERITY_INFO;
   std::string severity_name = "INFO";
   double rate = 0.0;  // messages per second, 0 = as fast as possible
+  std::uint64_t burst = 0;  // calls per burst, 0 = no burst pacing
+  double gap_ms = 0.0;      // pause between bursts
 };
 
 int parse_severity(const std::string & name)
@@ -102,12 +109,17 @@ Options parse_args(int argc, char ** argv)
       options.severity = parse_severity(options.severity_name);
     } else if (arg == "--rate") {
       options.rate = std::stod(value());
+    } else if (arg == "--burst") {
+      options.burst = std::stoull(value());
+    } else if (arg == "--gap-ms") {
+      options.gap_ms = std::stod(value());
     } else if (arg == "--logger-name") {
       options.logger_name = value();
     } else if (arg == "--help" || arg == "-h") {
       std::printf(
         "usage: %s --backend NAME [--count N] [--size BYTES] [--severity LEVEL] "
-        "[--rate MSG_PER_SEC] [--logger-name NAME] [--warmup N]\n", argv[0]);
+        "[--rate MSG_PER_SEC] [--burst N --gap-ms MS] [--logger-name NAME] [--warmup N]\n",
+        argv[0]);
       std::exit(0);
     } else {
       std::fprintf(stderr, "unknown argument '%s'\n", arg.c_str());
@@ -219,6 +231,10 @@ int main(int argc, char ** argv)
   const std::uint64_t start = now_ns();
   std::uint64_t next_deadline = start;
   for (std::uint64_t i = 0; i < options.count; ++i) {
+    if (options.burst != 0 && i != 0 && i % options.burst == 0 && options.gap_ms > 0.0) {
+      std::this_thread::sleep_for(
+        std::chrono::nanoseconds(static_cast<std::int64_t>(options.gap_ms * 1e6)));
+    }
     if (period_ns > 0.0) {
       // pace without drift: sleep until the scheduled slot
       next_deadline = start + static_cast<std::uint64_t>(period_ns * static_cast<double>(i));
@@ -255,13 +271,22 @@ int main(int argc, char ** argv)
   }
   const double wall_sec = static_cast<double>(end - start) / 1e9;
 
+  std::string mode = "sustained";
+  if (options.rate > 0.0) {
+    mode = "paced";
+  } else if (options.burst != 0) {
+    mode = "burst " + std::to_string(options.burst) + " / " +
+      std::to_string(static_cast<int>(options.gap_ms)) + " ms";
+  }
   std::printf(
-    "{\"backend\":\"%s\",\"count\":%" PRIu64 ",\"size\":%zu,\"severity\":\"%s\",\"rate\":%.0f,"
+    "{\"backend\":\"%s\",\"mode\":\"%s\",\"count\":%" PRIu64 ",\"size\":%zu,"
+    "\"severity\":\"%s\",\"rate\":%.0f,"
     "\"p50_ns\":%" PRIu64 ",\"p95_ns\":%" PRIu64 ",\"p99_ns\":%" PRIu64 ","
     "\"p999_ns\":%" PRIu64 ",\"max_ns\":%" PRIu64 ","
     "\"mean_ns\":%.1f,\"wall_sec\":%.6f,\"calls_per_sec\":%.1f,"
     "\"cpu_user_sec\":%.6f,\"cpu_sys_sec\":%.6f}\n",
     options.backend.c_str(),
+    mode.c_str(),
     options.count,
     options.size,
     options.severity_name.c_str(),
