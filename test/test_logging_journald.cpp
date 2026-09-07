@@ -100,6 +100,14 @@ std::vector<JournalEntry> read_journal(
       throw std::runtime_error(
               std::string("sd_journal_open failed: ") + std::strerror(-ret));
     }
+    // By default sd_journal_get_data() decompresses compressed fields only up
+    // to a 64 KiB threshold; the large message tests need the whole value.
+    ret = sd_journal_set_data_threshold(journal, 0);
+    if (ret < 0) {
+      sd_journal_close(journal);
+      throw std::runtime_error(
+              std::string("sd_journal_set_data_threshold failed: ") + std::strerror(-ret));
+    }
     for (const std::string & match : matches) {
       ret = sd_journal_add_match(journal, match.c_str(), 0);
       if (ret < 0) {
@@ -646,10 +654,11 @@ TEST_F(LoggingTest, large_message)
 
   std::vector<JournalEntry> entries = read_journal({node_match}, 3);
   ASSERT_EQ(3u, entries.size());
+  // Compare with EXPECT_TRUE so a mismatch does not dump 300 KiB into the log.
   EXPECT_EQ(ring_message.size(), entries[0].at("MESSAGE").size());
-  EXPECT_EQ(ring_message, entries[0].at("MESSAGE"));
+  EXPECT_TRUE(ring_message == entries[0].at("MESSAGE")) << "ring message content differs";
   EXPECT_EQ(sync_message.size(), entries[1].at("MESSAGE").size());
-  EXPECT_EQ(sync_message, entries[1].at("MESSAGE"));
+  EXPECT_TRUE(sync_message == entries[1].at("MESSAGE")) << "sync message content differs";
   EXPECT_EQ(after, entries[2].at("MESSAGE"));
 }
 
