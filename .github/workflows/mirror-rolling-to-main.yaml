@@ -7,6 +7,10 @@ on:
 jobs:
   mirror-to-master:
     runs-on: ubuntu-latest
+    # The action force-updates refs/heads/main with GITHUB_TOKEN. This repository
+    # gives workflows a read-only token by default, so request write access here.
+    permissions:
+      contents: write
     steps:
     - uses: zofrex/mirror-branch@v1
       with:
