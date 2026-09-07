@@ -21,7 +21,8 @@
 //
 // Hot path design (see doc/design.md, section 4.7):
 //   rcl_logging_external_log() copies the record into a preallocated ring
-//   buffer under a mutex and returns. One sender thread drains the ring and
+//   buffer (1 MiB unless RCL_LOGGING_JOURNAL_BUFFER_SIZE says otherwise) under
+//   a mutex and returns. One sender thread drains the ring and
 //   performs the sd_journal_sendv() (one sendmsg() and a journald wake up per
 //   record, several microseconds) off the caller's thread. This is the same
 //   idea as rcl_logging_spdlog's buffered file sink: the caller pays a memcpy,
@@ -63,6 +64,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -89,6 +91,7 @@ constexpr const char * kEnvIdentifier = "RCL_LOGGING_JOURNAL_IDENTIFIER";
 constexpr const char * kEnvExtraFields = "RCL_LOGGING_JOURNAL_EXTRA_FIELDS";
 constexpr const char * kEnvStrict = "RCL_LOGGING_JOURNAL_STRICT";
 constexpr const char * kEnvSocketPath = "RCL_LOGGING_JOURNAL_SOCKET_PATH";
+constexpr const char * kEnvBufferSize = "RCL_LOGGING_JOURNAL_BUFFER_SIZE";
 constexpr const char * kEnvRosDistro = "ROS_DISTRO";
 
 // Path libsystemd connects to inside sd_journal_sendv(). It is not
@@ -114,12 +117,17 @@ constexpr std::size_t kMessagePrefixLen = sizeof(kMessagePrefix) - 1;
 constexpr char kNodeNamePrefix[] = "ROS2_NODE_NAME=";
 constexpr std::size_t kNodeNamePrefixLen = sizeof(kNodeNamePrefix) - 1;
 
-// Ring buffer between the logging threads and the sender thread. 1 MiB holds
-// roughly 8000 typical records; pages are only touched as they get used.
-constexpr std::size_t kRingCapacity = 1u << 20;
-// Records larger than this bypass the ring and are sent synchronously (after
-// draining the ring so ordering is preserved). Covers backtraces and dumps.
-constexpr std::size_t kRingSyncThreshold = kRingCapacity / 4;
+// Ring buffer between the logging threads and the sender thread (see
+// doc/design.md, section 4.7). The default 1 MiB holds roughly 8000 typical
+// records; pages are only touched as they get used. RCL_LOGGING_JOURNAL_BUFFER_SIZE
+// overrides the capacity within [kMinRingCapacity, kMaxRingCapacity].
+constexpr std::size_t kDefaultRingCapacity = std::size_t{1} << 20;
+constexpr std::size_t kMinRingCapacity = std::size_t{4} << 10;
+constexpr std::size_t kMaxRingCapacity = std::size_t{1} << 30;
+// Records larger than capacity / kRingSyncDivisor bypass the ring and are sent
+// synchronously (after draining the ring so ordering is preserved). Covers
+// backtraces and dumps: 256 KiB with the default capacity.
+constexpr std::size_t kRingSyncDivisor = 4;
 // Stack scratch for the synchronous path; larger values fall back to the heap.
 constexpr std::size_t kSyncStackBuffer = 4096;
 
@@ -230,9 +238,13 @@ int send_direct(
 class Sender
 {
 public:
-  explicit Sender(const ConstantFields & constants)
+  // `capacity` is a multiple of 8 within [kMinRingCapacity, kMaxRingCapacity];
+  // parse_buffer_size() guarantees that.
+  Sender(const ConstantFields & constants, std::size_t capacity)
   : constants_(constants),
-    buffer_(new char[kRingCapacity]),
+    capacity_(capacity),
+    sync_threshold_(capacity / kRingSyncDivisor),
+    buffer_(new char[capacity]),
     worker_(&Sender::run, this)
   {
   }
@@ -275,7 +287,7 @@ public:
     const std::size_t message_field_len = kMessagePrefixLen + msg_len;
     const std::size_t total_len = sizeof(RecordHeader) + name_field_len + message_field_len;
     const std::size_t advance = round_up(total_len);
-    if (advance > kRingSyncThreshold || name_field_len > UINT16_MAX) {
+    if (advance > sync_threshold_ || name_field_len > UINT16_MAX) {
       // Too big for the ring: drain what is queued so ordering is kept, then
       // send from this thread (libsystemd uses a sealed memfd for big records).
       flush();
@@ -313,7 +325,7 @@ public:
       std::memcpy(cursor, kMessagePrefix, kMessagePrefixLen);
       std::memcpy(cursor + kMessagePrefixLen, msg, msg_len);
       tail_ += advance;
-      if (tail_ == kRingCapacity) {
+      if (tail_ == capacity_) {
         tail_ = 0;
       }
       used_ += advance;
@@ -371,11 +383,11 @@ private:
   // record would not be contiguous. Caller holds mutex_.
   bool reserve(std::size_t advance)
   {
-    if (tail_ + advance <= kRingCapacity) {
-      return kRingCapacity - used_ >= advance;
+    if (tail_ + advance <= capacity_) {
+      return capacity_ - used_ >= advance;
     }
-    const std::size_t pad = kRingCapacity - tail_;  // >= 8, multiple of 8
-    if (kRingCapacity - used_ < pad + advance) {
+    const std::size_t pad = capacity_ - tail_;  // >= 8, multiple of 8
+    if (capacity_ - used_ < pad + advance) {
       return false;
     }
     RecordHeader header;
@@ -438,7 +450,7 @@ private:
 
       lock.lock();
       head_ += advance;
-      if (head_ == kRingCapacity) {
+      if (head_ == capacity_) {
         head_ = 0;
       }
       used_ -= advance;
@@ -453,6 +465,8 @@ private:
   }
 
   const ConstantFields & constants_;
+  const std::size_t capacity_;        // ring size in bytes, multiple of 8
+  const std::size_t sync_threshold_;  // capacity_ / kRingSyncDivisor
   std::unique_ptr<char[]> buffer_;
 
   std::mutex mutex_;
@@ -518,6 +532,66 @@ bool parse_strict(const std::string & raw, bool & strict)
   RCUTILS_SET_ERROR_MSG_WITH_FORMAT_STRING(
     "invalid value '%s' for %s, expected 0/1/true/false", raw.c_str(), kEnvStrict);
   return false;
+}
+
+// Parses RCL_LOGGING_JOURNAL_BUFFER_SIZE: a decimal byte count with an optional
+// K, M or G suffix (powers of 1024), e.g. "262144", "256K", "4M". Empty selects
+// the default. The result is rounded up to a multiple of 8 (slot alignment)
+// and must be within [kMinRingCapacity, kMaxRingCapacity]. Returns true and
+// sets `capacity` on success; false with error set otherwise.
+bool parse_buffer_size(const std::string & raw, std::size_t & capacity)
+{
+  if (raw.empty()) {
+    capacity = kDefaultRingCapacity;
+    return true;
+  }
+  const auto invalid = [&raw]() {
+      RCUTILS_SET_ERROR_MSG_WITH_FORMAT_STRING(
+        "invalid value '%s' for %s, expected a byte count between %zu and %zu "
+        "with an optional K, M or G suffix (e.g. 256K or 4M)",
+        raw.c_str(), kEnvBufferSize, kMinRingCapacity, kMaxRingCapacity);
+      return false;
+    };
+  std::size_t pos = 0;
+  std::uint64_t value = 0;
+  while (pos < raw.size() && raw[pos] >= '0' && raw[pos] <= '9') {
+    const std::uint64_t digit = static_cast<std::uint64_t>(raw[pos] - '0');
+    if (value > (UINT64_MAX - digit) / 10) {
+      return invalid();
+    }
+    value = value * 10 + digit;
+    ++pos;
+  }
+  if (pos == 0) {
+    return invalid();  // no digits at all (also rejects a leading sign or space)
+  }
+  if (pos < raw.size()) {
+    unsigned shift = 0;
+    const char suffix = raw[pos];
+    if (suffix == 'k' || suffix == 'K') {
+      shift = 10;
+    } else if (suffix == 'm' || suffix == 'M') {
+      shift = 20;
+    } else if (suffix == 'g' || suffix == 'G') {
+      shift = 30;
+    } else {
+      return invalid();
+    }
+    if (pos + 1 != raw.size()) {
+      return invalid();  // trailing garbage such as "1MB"
+    }
+    if (value > (UINT64_MAX >> shift)) {
+      return invalid();
+    }
+    value <<= shift;
+  }
+  if (value < kMinRingCapacity || value > kMaxRingCapacity) {
+    return invalid();
+  }
+  // Slots are 8 byte aligned and the pad slot logic relies on the capacity
+  // being a multiple of 8. kMaxRingCapacity is one, so this stays in range.
+  capacity = (static_cast<std::size_t>(value) + 7u) & ~static_cast<std::size_t>(7u);
+  return true;
 }
 
 bool is_valid_field_name(const std::string & name)
@@ -681,7 +755,17 @@ rcl_logging_ret_t rcl_logging_external_initialize(
     return RCL_LOGGING_RET_INVALID_ARGUMENT;
   }
 
-  // 5. Probe the journald native socket. libsystemd manages the client
+  // 5. Ring buffer capacity between the producers and the sender thread.
+  std::string buffer_size_raw;
+  if (!get_env(kEnvBufferSize, buffer_size_raw)) {
+    return RCL_LOGGING_RET_ERROR;
+  }
+  std::size_t ring_capacity = kDefaultRingCapacity;
+  if (!parse_buffer_size(buffer_size_raw, ring_capacity)) {
+    return RCL_LOGGING_RET_INVALID_ARGUMENT;
+  }
+
+  // 6. Probe the journald native socket. libsystemd manages the client
   // socket internally, so there is no connection to hold here.
   std::string socket_path;
   if (!get_env(kEnvSocketPath, socket_path)) {
@@ -709,21 +793,22 @@ rcl_logging_ret_t rcl_logging_external_initialize(
     state->enabled = false;
   }
 
-  // 6. Start the sender thread. A forked child has no copy of it, so make
+  // 7. Start the sender thread. A forked child has no copy of it, so make
   // the child fall back to synchronous sends.
   if (state->enabled) {
     std::call_once(
       g_atfork_once, []() {
         pthread_atfork(nullptr, nullptr, &Sender::on_fork_child);
       });
-    state->sender = std::make_unique<Sender>(state->constants);
+    state->sender = std::make_unique<Sender>(state->constants, ring_capacity);
   }
 
   RCUTILS_LOG_DEBUG_NAMED(
     kLoggerName,
-    "journald logging backend initialized: %s, %zu extra field(s), strict=%d, enabled=%d",
+    "journald logging backend initialized: %s, %zu extra field(s), strict=%d, "
+    "buffer=%zu bytes, enabled=%d",
     constants.identifier_field.c_str(), constants.extra_fields.size(),
-    strict ? 1 : 0, state->enabled ? 1 : 0);
+    strict ? 1 : 0, ring_capacity, state->enabled ? 1 : 0);
 
   g_state = std::move(state);
   return RCL_LOGGING_RET_OK;

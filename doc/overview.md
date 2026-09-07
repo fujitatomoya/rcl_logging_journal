@@ -122,7 +122,7 @@ One backend, one socket, one daemon that is already running.
 | rcl_logging_interface | backend |
 |---|---|
 | `initialize` | resolve identifier, parse env, probe `/run/systemd/journal/socket`, pre-build constant fields |
-| `log(severity, name, msg)` | `memcpy` into a 1 MiB ring buffer, return; a sender thread does `sd_journal_sendv()` |
+| `log(severity, name, msg)` | `memcpy` into a ring buffer (1 MiB default), return; a sender thread does `sd_journal_sendv()` |
 | `set_logger_level` | ignored: rcl filters first, journald has `MaxLevelStore=` |
 | `shutdown` | drain the ring, report undeliverable count |
 
@@ -143,6 +143,7 @@ Same trade as rcl_logging_spdlog's buffered file sink. The ceiling stays journal
 | `RCL_LOGGING_JOURNAL_IDENTIFIER` | executable | `SYSLOG_IDENTIFIER`, `journalctl -t` |
 | `RCL_LOGGING_JOURNAL_EXTRA_FIELDS` | empty | `ROBOT_ID=amr-07;FLEET=tokyo`, indexed |
 | `RCL_LOGGING_JOURNAL_STRICT` | `1` | fail init without journald, or no-op |
+| `RCL_LOGGING_JOURNAL_BUFFER_SIZE` | `1M` | ring buffer capacity, `4K` to `1G` |
 
 - Rotation, compression, rate limits: `journald.conf(5)`, not duplicated here.
 - Shipped drop-in: `config/ros2-journald.conf`.
