@@ -251,12 +251,12 @@ TEST_F(AllocatorTest, init_invalid)
 
   EXPECT_EQ(
     RCL_LOGGING_RET_ERROR,
-    rcl_logging_external_initialize(nullptr, nullptr, bad_allocator));
+    rcl_logging_external_initialize(nullptr, bad_allocator));
   EXPECT_TRUE(rcutils_error_is_set());
   rcutils_reset_error();
   EXPECT_EQ(
     RCL_LOGGING_RET_INVALID_ARGUMENT,
-    rcl_logging_external_initialize(nullptr, nullptr, invalid_allocator));
+    rcl_logging_external_initialize(nullptr, invalid_allocator));
   rcutils_reset_error();
 }
 
@@ -265,11 +265,11 @@ TEST_F(AllocatorTest, init_valid)
   // Config files are not supported and pass through with a warning.
   EXPECT_EQ(
     RCL_LOGGING_RET_OK,
-    rcl_logging_external_initialize(nullptr, "config_file", allocator));
+    rcl_logging_external_initialize("config_file", allocator));
   // Initializing twice is fine.
   EXPECT_EQ(
     RCL_LOGGING_RET_OK,
-    rcl_logging_external_initialize(nullptr, nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
   // Shutting down twice is fine as well.
   EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
@@ -278,7 +278,7 @@ TEST_F(AllocatorTest, init_valid)
 
 TEST_F(LoggingTest, record_fields)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   const std::string message = "record_fields " + token;
   rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), message.c_str());
@@ -314,7 +314,7 @@ TEST_F(LoggingTest, record_fields)
 
 TEST_F(LoggingTest, severity_mapping)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   for (int severity : logger_levels) {
     std::stringstream ss;
@@ -343,9 +343,9 @@ TEST_F(LoggingTest, severity_mapping)
 
 TEST_F(LoggingTest, full_cycle)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
   // Make sure we can call initialize more than once
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   // The backend does not filter: rcl filters on the logger level before the
   // backend is called and journald filters with MaxLevelStore=. So
@@ -374,7 +374,7 @@ TEST_F(LoggingTest, full_cycle)
 
 TEST_F(LoggingTest, shutdown_drains_queue)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   // More bytes than the 1 MiB ring holds, so producers wrap and block on the
   // sender thread; every record must still be in the journal after shutdown,
@@ -400,7 +400,7 @@ TEST_F(LoggingTest, shutdown_drains_queue)
 
 TEST_F(LoggingTest, concurrent_producers_keep_order)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   constexpr int threads = 4;
   constexpr int per_thread = 2000;
@@ -445,7 +445,7 @@ TEST_F(LoggingTest, concurrent_producers_keep_order)
 
 TEST_F(LoggingTest, fatal_is_synchronous)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   // Queue a burst, then a FATAL: when the FATAL call returns, it and every
   // record before it must already have been handed to journald. Verify with a
@@ -468,7 +468,7 @@ TEST_F(LoggingTest, fatal_is_synchronous)
 
 TEST_F(LoggingTest, no_logger_name)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   // rcl logs some records without a logger name; they must still be stored,
   // just without ROS2_NODE_NAME. Match on the unique MESSAGE instead.
@@ -487,42 +487,16 @@ TEST_F(LoggingTest, no_logger_name)
   }
 }
 
-TEST_F(LoggingTest, file_name_prefix_as_identifier)
-{
-  RestoreEnvVar identifier_var("RCL_LOGGING_JOURNAL_IDENTIFIER");
-  ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_IDENTIFIER", nullptr));
-
-  // --log-file-name prefix is used as SYSLOG_IDENTIFIER when no env override.
-  const std::string prefix = "prefix_" + token;
-  ASSERT_EQ(
-    RCL_LOGGING_RET_OK,
-    rcl_logging_external_initialize(prefix.c_str(), nullptr, allocator));
-  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), "prefix test");
-
-  std::vector<JournalEntry> entries = read_journal({node_match}, 1);
-  ASSERT_EQ(1u, entries.size());
-  EXPECT_EQ(prefix, entries.front().at("SYSLOG_IDENTIFIER"));
-  EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
-
-  // An empty prefix falls back to the executable name.
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize("", nullptr, allocator));
-  const std::string message = "empty prefix " + token;
-  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), message.c_str());
-  entries = read_journal({node_match, "MESSAGE=" + message}, 1);
-  ASSERT_EQ(1u, entries.size());
-  EXPECT_EQ(executable_name(), entries.front().at("SYSLOG_IDENTIFIER"));
-}
-
 TEST_F(LoggingTest, identifier_override)
 {
   RestoreEnvVar identifier_var("RCL_LOGGING_JOURNAL_IDENTIFIER");
   const std::string identifier = "custom_ident_" + token;
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_IDENTIFIER", identifier.c_str()));
 
-  // The env override wins over the file name prefix.
+  // The env override wins over the executable name.
   ASSERT_EQ(
     RCL_LOGGING_RET_OK,
-    rcl_logging_external_initialize("ignored_prefix", nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   rcl_logging_external_log(RCUTILS_LOG_SEVERITY_ERROR, logger_name.c_str(), "identifier test");
 
   // journalctl -t <identifier> maps to this match.
@@ -539,7 +513,7 @@ TEST_F(LoggingTest, extra_fields)
   const std::string extra = "ROBOT_ID=" + robot_id + ";FLEET=tokyo;EMPTY_VALUE=;";
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_EXTRA_FIELDS", extra.c_str()));
 
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
   rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), "extra fields");
 
   // Extra fields are indexed like any other field: match on ROBOT_ID.
@@ -568,7 +542,7 @@ TEST_F(LoggingTest, extra_fields_invalid)
     ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_EXTRA_FIELDS", value));
     EXPECT_EQ(
       RCL_LOGGING_RET_INVALID_ARGUMENT,
-      rcl_logging_external_initialize(nullptr, nullptr, allocator)) << value;
+      rcl_logging_external_initialize(nullptr, allocator)) << value;
     EXPECT_TRUE(rcutils_error_is_set()) << value;
     rcutils_reset_error();
     EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
@@ -582,7 +556,7 @@ TEST_F(LoggingTest, extra_fields_invalid)
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_EXTRA_FIELDS", too_many.str().c_str()));
   EXPECT_EQ(
     RCL_LOGGING_RET_INVALID_ARGUMENT,
-    rcl_logging_external_initialize(nullptr, nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   rcutils_reset_error();
 }
 
@@ -598,7 +572,7 @@ TEST_F(LoggingTest, strict_mode)
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_STRICT", nullptr));
   EXPECT_EQ(
     RCL_LOGGING_RET_ERROR,
-    rcl_logging_external_initialize(nullptr, nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   ASSERT_TRUE(rcutils_error_is_set());
   EXPECT_NE(nullptr, std::strstr(rcutils_get_error_string().str, missing.c_str()));
   rcutils_reset_error();
@@ -607,7 +581,7 @@ TEST_F(LoggingTest, strict_mode)
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_STRICT", "1"));
   EXPECT_EQ(
     RCL_LOGGING_RET_ERROR,
-    rcl_logging_external_initialize(nullptr, nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   rcutils_reset_error();
   EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
 
@@ -615,7 +589,7 @@ TEST_F(LoggingTest, strict_mode)
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_STRICT", "0"));
   EXPECT_EQ(
     RCL_LOGGING_RET_OK,
-    rcl_logging_external_initialize(nullptr, nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   const std::string message = "strict_mode must not be stored " + token;
   rcl_logging_external_log(RCUTILS_LOG_SEVERITY_FATAL, logger_name.c_str(), message.c_str());
   EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_set_logger_level(nullptr, 0));
@@ -627,13 +601,13 @@ TEST_F(LoggingTest, strict_mode)
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_STRICT", "maybe"));
   EXPECT_EQ(
     RCL_LOGGING_RET_INVALID_ARGUMENT,
-    rcl_logging_external_initialize(nullptr, nullptr, allocator));
+    rcl_logging_external_initialize(nullptr, allocator));
   rcutils_reset_error();
 }
 
 TEST_F(LoggingTest, large_message)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   auto make_message = [this](const char * tag, std::size_t target) {
       std::string message = std::string(tag) + " " + token + " ";
@@ -664,7 +638,7 @@ TEST_F(LoggingTest, large_message)
 
 TEST_F(LoggingTest, long_logger_name)
 {
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   // Hierarchical logger names can exceed the stack scratch buffer.
   std::string long_name = logger_name;
@@ -685,7 +659,7 @@ TEST_F(LoggingTest, journalctl_smoke)
   if (std::system("journalctl --version > /dev/null 2>&1") != 0) {
     GTEST_SKIP() << "journalctl is not available";
   }
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   const std::string message = "journalctl_smoke " + token;
   rcl_logging_external_log(RCUTILS_LOG_SEVERITY_WARN, logger_name.c_str(), message.c_str());

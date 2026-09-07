@@ -75,7 +75,6 @@
 #include "rcutils/logging.h"
 #include "rcutils/logging_macros.h"
 #include "rcutils/process.h"
-#include "rcutils/strdup.h"
 
 #include "rcl_logging_interface/rcl_logging_interface.h"
 
@@ -593,8 +592,10 @@ bool parse_extra_fields(const std::string & raw, ConstantFields & constants)
 
 }  // namespace
 
+// Humble ships rcl_logging_interface 2.x, whose initialize() has no
+// file_name_prefix parameter (added in 3.0.0 / Jazzy). The identifier is
+// therefore the env override or the executable name.
 rcl_logging_ret_t rcl_logging_external_initialize(
-  const char * file_name_prefix,
   const char * config_file,
   rcutils_allocator_t allocator)
 {
@@ -621,20 +622,13 @@ rcl_logging_ret_t rcl_logging_external_initialize(
   auto state = std::make_unique<JournalState>();
   ConstantFields & constants = state->constants;
 
-  // 1. SYSLOG_IDENTIFIER: env override -> file name prefix -> executable name.
+  // 1. SYSLOG_IDENTIFIER: env override -> executable name.
   std::string identifier;
   if (!get_env(kEnvIdentifier, identifier)) {
     return RCL_LOGGING_RET_ERROR;
   }
   if (identifier.empty()) {
-    const bool file_name_provided =
-      (nullptr != file_name_prefix) && (file_name_prefix[0] != '\0');
-    char * basec = nullptr;
-    if (file_name_provided) {
-      basec = rcutils_strdup(file_name_prefix, allocator);
-    } else {
-      basec = rcutils_get_executable_name(allocator);
-    }
+    char * basec = rcutils_get_executable_name(allocator);
     if (basec == nullptr) {
       RCUTILS_SET_ERROR_MSG("Failed to get the executable name for SYSLOG_IDENTIFIER");
       return RCL_LOGGING_RET_ERROR;

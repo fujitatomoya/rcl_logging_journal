@@ -41,7 +41,6 @@ public:
   {
     rcl_logging_ret_t ret = rcl_logging_external_initialize(
       nullptr,
-      nullptr,
       rcutils_get_default_allocator());
     if (ret != RCL_LOGGING_RET_OK) {
       st.SkipWithError(rcutils_get_error_string().str);

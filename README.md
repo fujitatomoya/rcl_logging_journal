@@ -230,7 +230,7 @@ The backend itself is configured through environment variables only. Everything 
 
 | environmental variable | default | Note |
 | :----------------------| :------ | :--- |
-| `RCL_LOGGING_JOURNAL_IDENTIFIER` | executable name (or the `--log-file-name` prefix if given) | Value of `SYSLOG_IDENTIFIER`, what `journalctl -t <identifier>` matches. Useful when many nodes share one process, e.g. component containers. |
+| `RCL_LOGGING_JOURNAL_IDENTIFIER` | executable name | Value of `SYSLOG_IDENTIFIER`, what `journalctl -t <identifier>` matches. Useful when many nodes share one process, e.g. component containers. |
 | `RCL_LOGGING_JOURNAL_EXTRA_FIELDS` | *(empty)* | `;`-separated static `KEY=VALUE` pairs attached to every record, e.g. `ROBOT_ID=amr-07;FLEET=tokyo`. Keys must be `[A-Z0-9_]`, not start with `_`, at most 64 characters, at most 32 entries, and must not be one of the fields set by the backend. Invalid values fail initialization. |
 | `RCL_LOGGING_JOURNAL_STRICT` | `1` | `1`: initialization fails with an actionable error when journald is not available. `0`: initialization succeeds and the backend becomes a no-op (rcl's stdout and rosout outputs keep working). |
 | `RCL_LOGGING_JOURNAL_SOCKET_PATH` | `/run/systemd/journal/socket` | Path probed at initialization to decide whether journald is available. Diagnostic/testing knob only; libsystemd always sends to the default path. |

@@ -237,7 +237,7 @@ rcl_logging_journal/
 
 | rcl_logging_interface | journald backend behavior |
 |---|---|
-| `rcl_logging_external_initialize(file_name_prefix, config_file, allocator)` | Validate the allocator. Idempotent when already initialized. Warn if a `config_file` is given (journald has no client side configuration file). Resolve `SYSLOG_IDENTIFIER`: `RCL_LOGGING_JOURNAL_IDENTIFIER`, else `file_name_prefix` (`--log-file-name`), else the executable name. Cache `ROS2_DISTRO` from `$ROS_DISTRO`. Parse and validate `RCL_LOGGING_JOURNAL_EXTRA_FIELDS`. Probe journald availability with `access("/run/systemd/journal/socket", W_OK)`. Return `RCL_LOGGING_RET_ERROR` with an actionable message if unavailable in strict mode. No connection to hold: `sd_journal_sendv` manages its own socket. |
+| `rcl_logging_external_initialize(config_file, allocator)` (Humble: rcl_logging_interface 2.x has no `file_name_prefix` parameter) | Validate the allocator. Idempotent when already initialized. Warn if a `config_file` is given (journald has no client side configuration file). Resolve `SYSLOG_IDENTIFIER`: `RCL_LOGGING_JOURNAL_IDENTIFIER`, else the executable name. Cache `ROS2_DISTRO` from `$ROS_DISTRO`. Parse and validate `RCL_LOGGING_JOURNAL_EXTRA_FIELDS`. Probe journald availability with `access("/run/systemd/journal/socket", W_OK)`. Return `RCL_LOGGING_RET_ERROR` with an actionable message if unavailable in strict mode. No connection to hold: `sd_journal_sendv` manages its own socket. |
 | `rcl_logging_external_log(severity, name, msg)` | Map severity (4.3). Copy `ROS2_NODE_NAME=<name>` and `MESSAGE=<msg>` into the ring buffer under the producer mutex and return; the sender thread appends the pre-built constant iovecs and calls `sd_journal_sendv()` once per record. `name` may be NULL/empty (rcl logs some records with no logger): omit `ROS2_NODE_NAME`, keep `SYSLOG_IDENTIFIER`. FATAL waits until its record has been handed to journald. Records above 256 KiB drain the ring and are sent synchronously to keep ordering. Send failures are counted, never retried. |
 | `rcl_logging_external_set_logger_level(name, level)` | Accepted and ignored. rcl filters on the rcutils logger level before calling the backend, so a second threshold only costs time; storage side filtering is journald's `MaxLevelStore=`. Same split as `rcl_logging_syslog` and rsyslog. |
 | `rcl_logging_external_shutdown()` | Drain the ring (the sender thread is joined), report the number of undeliverable records (if any) through rcutils logging, reset state. Durability is journald's job (immediate for CRIT+). |
@@ -263,7 +263,7 @@ Following the `RCL_LOGGING_SYSLOG_FACILITY` precedent: env-only, sane defaults:
 
 | variable | default | purpose |
 |---|---|---|
-| `RCL_LOGGING_JOURNAL_IDENTIFIER` | executable short name (or `--log-file-name` prefix) | overrides `SYSLOG_IDENTIFIER` (useful when many nodes share one process, e.g. component containers) |
+| `RCL_LOGGING_JOURNAL_IDENTIFIER` | executable short name | overrides `SYSLOG_IDENTIFIER` (useful when many nodes share one process, e.g. component containers) |
 | `RCL_LOGGING_JOURNAL_EXTRA_FIELDS` | *(empty)* | `;`-separated static `KEY=VALUE` pairs attached to every record (e.g. `ROBOT_ID=amr-07;FLEET=tokyo`), fully indexed, enables fleet-level `journalctl` queries. Keys must follow journald rules (`[A-Z0-9_]`, no leading `_`, at most 64 characters), must not collide with fields set by the backend, at most 32 entries. Invalid input fails initialization with `RCL_LOGGING_RET_INVALID_ARGUMENT`. |
 | `RCL_LOGGING_JOURNAL_STRICT` | `1` | `1`: fail init when journald socket is absent. `0`: init succeeds, backend becomes no-op (stderr/rosout continue to work via rcl's other output flags) |
 | `RCL_LOGGING_JOURNAL_SOCKET_PATH` | `/run/systemd/journal/socket` | path probed at initialization to decide whether journald is available. Diagnostic/testing knob: libsystemd itself always sends to the default path. |
@@ -359,7 +359,7 @@ Same philosophy as `rcl_logging_syslog`'s colcon test (which writes via the back
 3. Read back via the **`sd_journal` read API** (`sd_journal_open` + `sd_journal_add_match("ROS2_NODE_NAME=<token>")`), asserting: message content, `PRIORITY` mapping, presence of `ROS2_NODE_NAME`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO`, absence of `CODE_*`, and journald's trusted `_PID` / `_TRANSPORT=journal`.
 4. Level test: for every (level, severity) pair, `set_logger_level()` is accepted and every record is stored (the backend does not filter). Additional tests cover draining 20k records through the ring at shutdown, ordering across four producer threads, and the synchronous FATAL guarantee.
 5. Records without a logger name are stored without `ROS2_NODE_NAME`.
-6. `SYSLOG_IDENTIFIER` precedence: env override, `--log-file-name` prefix, executable name.
+6. `SYSLOG_IDENTIFIER` precedence: env override, executable name (Humble has no `--log-file-name` prefix in the interface).
 7. Extra fields are stored and indexed; invalid extra fields fail initialization.
 8. Strict-mode test: point `RCL_LOGGING_JOURNAL_SOCKET_PATH` at a nonexistent path, assert init failure with `STRICT=1` (error message names the path) and no-op success with `STRICT=0` (nothing stored).
 9. Fallback path test: log one 300 KiB message to exercise the memfd path and journald compression.

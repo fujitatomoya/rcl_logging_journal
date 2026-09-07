@@ -54,7 +54,8 @@
 namespace
 {
 
-using initialize_fn = rcl_logging_ret_t (*)(const char *, const char *, rcutils_allocator_t);
+// Humble: rcl_logging_interface 2.x, initialize(config_file, allocator).
+using initialize_fn = rcl_logging_ret_t (*)(const char *, rcutils_allocator_t);
 using shutdown_fn = rcl_logging_ret_t (*)(void);
 using log_fn = void (*)(int, const char *, const char *);
 using set_level_fn = rcl_logging_ret_t (*)(const char *, int);
@@ -180,7 +181,7 @@ int main(int argc, char ** argv)
   auto log = resolve<log_fn>(handle, "rcl_logging_external_log");
   auto set_level = resolve<set_level_fn>(handle, "rcl_logging_external_set_logger_level");
 
-  if (initialize(nullptr, nullptr, rcutils_get_default_allocator()) != RCL_LOGGING_RET_OK) {
+  if (initialize(nullptr, rcutils_get_default_allocator()) != RCL_LOGGING_RET_OK) {
     std::fprintf(stderr, "%s: initialize failed\n", options.backend.c_str());
     return 1;
   }
