@@ -349,7 +349,8 @@ public:
   }
 
 private:
-  enum : std::uint8_t { kRecord = 0, kPad = 1 };
+  static constexpr std::uint8_t kRecord = 0;
+  static constexpr std::uint8_t kPad = 1;
 
   struct RecordHeader
   {
