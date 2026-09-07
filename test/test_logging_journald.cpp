@@ -605,6 +605,78 @@ TEST_F(LoggingTest, strict_mode)
   rcutils_reset_error();
 }
 
+TEST_F(LoggingTest, buffer_size)
+{
+  RestoreEnvVar buffer_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE");
+  // The smallest ring: 4 KiB holds about 15 of these records, so 3000 records
+  // wrap the ring hundreds of times, exercise pad slots at every offset and
+  // block producers on a full ring. Everything must still arrive, in order.
+  ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE", "4K"));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
+
+  constexpr int count = 3000;
+  std::string payload(150, 'b');
+  for (int i = 0; i < count; ++i) {
+    std::stringstream ss;
+    ss << "buffer_size " << token << " " << i << " " << payload.substr(0, (i * 7) % 150);
+    rcl_logging_external_log(RCUTILS_LOG_SEVERITY_INFO, logger_name.c_str(), ss.str().c_str());
+  }
+  // A record above a quarter of the ring (1 KiB here) takes the synchronous
+  // path after draining the ring; it must land after everything before it.
+  const std::string big = "buffer_size " + token + " big " + std::string(2000, 'B');
+  rcl_logging_external_log(RCUTILS_LOG_SEVERITY_WARN, logger_name.c_str(), big.c_str());
+  EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
+
+  std::vector<JournalEntry> entries =
+    read_journal({node_match}, count + 1, std::chrono::seconds(60));
+  ASSERT_EQ(static_cast<std::size_t>(count + 1), entries.size());
+  for (int i = 0; i < count; ++i) {
+    std::stringstream ss;
+    ss << "buffer_size " << token << " " << i << " ";
+    EXPECT_EQ(0u, entries[static_cast<std::size_t>(i)].at("MESSAGE").rfind(ss.str(), 0))
+      << "record " << i << " out of order";
+  }
+  EXPECT_EQ(big, entries.back().at("MESSAGE"));
+
+  // Sizes without a suffix and with a lowercase suffix are accepted too.
+  for (const char * value : {"8192", "16k", "1M", "1g"}) {
+    ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE", value));
+    EXPECT_EQ(
+      RCL_LOGGING_RET_OK,
+      rcl_logging_external_initialize(nullptr, allocator)) << value;
+    EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
+  }
+}
+
+TEST_F(LoggingTest, buffer_size_invalid)
+{
+  RestoreEnvVar buffer_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE");
+
+  const char * invalid_values[] = {
+    "abc",        // not a number
+    "-1",         // sign is not accepted
+    " 64K",       // no whitespace
+    "1MB",        // only a single K/M/G suffix
+    "1.5M",       // integers only
+    "0",          // below the 4 KiB minimum
+    "4095",       // just below the minimum
+    "2G",         // above the 1 GiB maximum
+    "99999999999999999999",  // overflows
+  };
+  for (const char * value : invalid_values) {
+    ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE", value));
+    EXPECT_EQ(
+      RCL_LOGGING_RET_INVALID_ARGUMENT,
+      rcl_logging_external_initialize(nullptr, allocator)) << value;
+    EXPECT_TRUE(rcutils_error_is_set()) << value;
+    EXPECT_NE(
+      nullptr,
+      std::strstr(rcutils_get_error_string().str, "RCL_LOGGING_JOURNAL_BUFFER_SIZE")) << value;
+    rcutils_reset_error();
+    EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
+  }
+}
+
 TEST_F(LoggingTest, large_message)
 {
   ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));

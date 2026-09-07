@@ -234,6 +234,7 @@ The backend itself is configured through environment variables only. Everything 
 | `RCL_LOGGING_JOURNAL_EXTRA_FIELDS` | *(empty)* | `;`-separated static `KEY=VALUE` pairs attached to every record, e.g. `ROBOT_ID=amr-07;FLEET=tokyo`. Keys must be `[A-Z0-9_]`, not start with `_`, at most 64 characters, at most 32 entries, and must not be one of the fields set by the backend. Invalid values fail initialization. |
 | `RCL_LOGGING_JOURNAL_STRICT` | `1` | `1`: initialization fails with an actionable error when journald is not available. `0`: initialization succeeds and the backend becomes a no-op (rcl's stdout and rosout outputs keep working). |
 | `RCL_LOGGING_JOURNAL_SOCKET_PATH` | `/run/systemd/journal/socket` | Path probed at initialization to decide whether journald is available. Diagnostic/testing knob only; libsystemd always sends to the default path. |
+| `RCL_LOGGING_JOURNAL_BUFFER_SIZE` | `1M` (1 MiB) | Capacity of the ring buffer that decouples your threads from journald (see [Performance](#performance)). A byte count with an optional `K`, `M` or `G` suffix, from `4K` to `1G`. Bigger absorbs longer bursts without blocking the caller but loses more records if the process is killed before they are sent; only touched pages are resident. Records larger than a quarter of it are sent synchronously. Invalid values fail initialization. |
 
 The backend does **not** filter by severity. rcl already filters on the logger level (`--ros-args --log-level`) before any backend is called, and journald can drop levels at the daemon with `MaxLevelStore=` in `journald.conf(5)`, the same split as `rcl_logging_syslog` with rsyslog. Everything that reaches the backend is stored.
 
@@ -243,6 +244,7 @@ Examples:
 export RCL_LOGGING_JOURNAL_IDENTIFIER=nav2_container
 export RCL_LOGGING_JOURNAL_EXTRA_FIELDS="ROBOT_ID=amr-07;FLEET=tokyo"
 export RCL_LOGGING_JOURNAL_STRICT=0
+export RCL_LOGGING_JOURNAL_BUFFER_SIZE=4M
 ```
 
 ### Record schema
@@ -300,10 +302,10 @@ journald drops records from a service that logs more than `RateLimitBurst` (defa
 
 ## Performance
 
-`rcl_logging_external_log()` copies the record into a preallocated 1 MiB ring buffer under a mutex and returns; one sender thread per process drains the ring with `sd_journal_sendv()`. The caller therefore pays a `memcpy`, not the `sendmsg()` syscall and journald wake up (about 6 µs on a desktop, see below), which is the same trade `rcl_logging_spdlog` makes with its buffered file sink. Three things keep it safe:
+`rcl_logging_external_log()` copies the record into a preallocated ring buffer (1 MiB by default, `RCL_LOGGING_JOURNAL_BUFFER_SIZE`) under a mutex and returns; one sender thread per process drains the ring with `sd_journal_sendv()`. The caller therefore pays a `memcpy`, not the `sendmsg()` syscall and journald wake up (about 6 µs on a desktop, see below), which is the same trade `rcl_logging_spdlog` makes with its buffered file sink. Three things keep it safe:
 
 - **FATAL is synchronous**: the call returns only after the record is in journald's hands, and journald fsyncs `CRIT` and above at once, so a FATAL followed by a crash is on disk.
-- **Order is preserved**: one consumer sends in enqueue order, also across threads. Records above 256 KiB bypass the ring after draining it.
+- **Order is preserved**: one consumer sends in enqueue order, also across threads. Records above a quarter of the ring (256 KiB by default) bypass the ring after draining it.
 - **Nothing is dropped**: when journald is slower than the producers the ring fills and callers block, exactly like the synchronous version; `rcl_logging_external_shutdown()` (called by `rcl_shutdown`) and process exit drain the ring.
 
 `PRIORITY`, `SYSLOG_IDENTIFIER`, `ROS2_DISTRO` and extra fields are pre-built at initialization; there is no heap allocation, formatting, or filtering on the hot path.
