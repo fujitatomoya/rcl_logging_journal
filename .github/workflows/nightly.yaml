@@ -1,0 +1,28 @@
+name: Nightly Build for All Distributions
+
+on:
+  schedule:
+    - cron: '0 13 * * *'  # Runs every day at midnight, 13:00 UTC
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  nightly-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        branch: [rolling, lyrical, kilted, jazzy, humble]
+    container:
+      image: tomoyafujita/ros2dev:${{ matrix.branch }}
+      env:
+        ROS_DISTRO: ${{ matrix.branch }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.branch }}
+      - name: Build and Test
+        shell: bash
+        run: |
+          ./scripts/github_workflows.sh
