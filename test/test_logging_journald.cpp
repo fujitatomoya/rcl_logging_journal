@@ -612,7 +612,7 @@ TEST_F(LoggingTest, buffer_size)
   // wrap the ring hundreds of times, exercise pad slots at every offset and
   // block producers on a full ring. Everything must still arrive, in order.
   ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE", "4K"));
-  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, nullptr, allocator));
+  ASSERT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_initialize(nullptr, allocator));
 
   constexpr int count = 3000;
   std::string payload(150, 'b');
@@ -643,7 +643,7 @@ TEST_F(LoggingTest, buffer_size)
     ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE", value));
     EXPECT_EQ(
       RCL_LOGGING_RET_OK,
-      rcl_logging_external_initialize(nullptr, nullptr, allocator)) << value;
+      rcl_logging_external_initialize(nullptr, allocator)) << value;
     EXPECT_EQ(RCL_LOGGING_RET_OK, rcl_logging_external_shutdown());
   }
 }
@@ -667,7 +667,7 @@ TEST_F(LoggingTest, buffer_size_invalid)
     ASSERT_TRUE(rcpputils::set_env_var("RCL_LOGGING_JOURNAL_BUFFER_SIZE", value));
     EXPECT_EQ(
       RCL_LOGGING_RET_INVALID_ARGUMENT,
-      rcl_logging_external_initialize(nullptr, nullptr, allocator)) << value;
+      rcl_logging_external_initialize(nullptr, allocator)) << value;
     EXPECT_TRUE(rcutils_error_is_set()) << value;
     EXPECT_NE(
       nullptr,
