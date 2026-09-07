@@ -12,7 +12,9 @@ Changelog for package rcl_logging_journal
   sent to journald by one sender thread; FATAL stays synchronous; no severity
   filtering in the backend (rcl and journald MaxLevelStore= do that).
 * Environment configuration: RCL_LOGGING_JOURNAL_IDENTIFIER,
-  RCL_LOGGING_JOURNAL_EXTRA_FIELDS, RCL_LOGGING_JOURNAL_STRICT.
+  RCL_LOGGING_JOURNAL_EXTRA_FIELDS, RCL_LOGGING_JOURNAL_STRICT,
+  RCL_LOGGING_JOURNAL_SOCKET_PATH, RCL_LOGGING_JOURNAL_BUFFER_SIZE (ring
+  buffer capacity, 1 MiB by default).
 * gtest suite reading records back through the sd_journal API and journalctl.
 * GitHub workflows per distribution with a standalone journald in the container,
   Mergify backports, codespell, stale and ABI checks.
