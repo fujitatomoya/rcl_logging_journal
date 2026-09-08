@@ -56,15 +56,6 @@ services:
       - /run/systemd/journal/socket:/run/systemd/journal/socket
 ```
 
-### Podman
-
-```bash
-podman run -it --rm \
-  -v /run/systemd/journal/socket:/run/systemd/journal/socket \
-  -e RCL_LOGGING_IMPLEMENTATION=rcl_logging_journal \
-  my_ros2_image ros2 run demo_nodes_cpp talker
-```
-
 ## 2. What the host sees
 
 Trusted fields are filled by the **host** journald from the sender's kernel credentials, so they describe the container process as the host sees it:
@@ -99,7 +90,7 @@ journalctl CONTAINER=talker
 
 - The socket is world writable (`srw-rw-rw-`), so any uid inside the container can send. No `--privileged`, no extra capabilities, no group mapping needed for **writing**.
 - **Reading** the journal from inside the container is a different matter: it requires the journal files (`/var/log/journal`) and membership in `systemd-journal`. Prefer reading on the host; if you must read inside, bind `/var/log/journal:/var/log/journal:ro` and `/etc/machine-id:/etc/machine-id:ro` and run as a uid in the `systemd-journal` group of the host.
-- Rootless Podman/Docker: the bind mount works the same; `_UID` shows the host uid the container user maps to.
+- Rootless Docker: the bind mount works the same; `_UID` shows the host uid the container user maps to.
 
 ## 4. When the socket is not there
 
@@ -128,7 +119,7 @@ Logs then live in the container's `/run/log/journal` (volatile) and `journalctl`
 
 ## 6. Container logs from stdout too?
 
-Docker and Podman also offer a `journald` **log driver** that captures the container's stdout/stderr. That path goes through the container runtime, is line oriented, and has no ROS fields. `rcl_logging_journal` complements it: keep `--log-driver journald` for anything printed, and use the native socket for structured ROS records. Disable rcl's stdout output (`--ros-args --disable-stdout-logs`) if you do not want both.
+Docker also offers a `journald` **log driver** that captures the container's stdout/stderr. That path goes through the container runtime, is line oriented, and has no ROS fields. `rcl_logging_journal` complements it: keep `--log-driver journald` for anything printed, and use the native socket for structured ROS records. Disable rcl's stdout output (`--ros-args --disable-stdout-logs`) if you do not want both.
 
 ## Reference
 
