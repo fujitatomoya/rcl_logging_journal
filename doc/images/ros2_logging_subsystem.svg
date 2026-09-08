@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="360" viewBox="0 0 1000 360" font-family="Helvetica, Arial, sans-serif" font-size="14">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="360" fill="#ffffff"/>
+
+  <!-- top row: application -> rcutils -> rcl output handlers -->
+  <rect x="20" y="40" width="180" height="60" rx="8" fill="#e8f1fb" stroke="#2b6cb0" stroke-width="2"/>
+  <text x="110" y="64" text-anchor="middle" font-size="15" font-weight="bold" fill="#1a365d">rclcpp / rclpy</text>
+  <text x="110" y="84" text-anchor="middle" font-size="12" fill="#2d3748">ROS 2 application</text>
+
+  <line x1="200" y1="70" x2="248" y2="70" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="224" y="60" text-anchor="middle" font-size="11" fill="#4a5568">RCLCPP_INFO(...)</text>
+
+  <rect x="250" y="40" width="180" height="60" rx="8" fill="#f7fafc" stroke="#4a5568" stroke-width="2"/>
+  <text x="340" y="64" text-anchor="middle" font-size="15" font-weight="bold" fill="#2d3748">rcutils logging</text>
+  <text x="340" y="84" text-anchor="middle" font-size="12" fill="#2d3748">severity filter, formatting</text>
+
+  <line x1="430" y1="70" x2="478" y2="70" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="454" y="60" text-anchor="middle" font-size="11" fill="#4a5568">log record</text>
+
+  <rect x="480" y="40" width="200" height="60" rx="8" fill="#edf2f7" stroke="#4a5568" stroke-width="2"/>
+  <text x="580" y="64" text-anchor="middle" font-size="15" font-weight="bold" fill="#2d3748">rcl output handlers</text>
+  <text x="580" y="84" text-anchor="middle" font-size="12" fill="#2d3748">up to three outputs</text>
+
+  <!-- fan out from rcl output handlers -->
+  <line x1="500" y1="100" x2="500" y2="263" stroke="#444" stroke-width="2"/>
+  <line x1="500" y1="150" x2="528" y2="150" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="500" y1="205" x2="528" y2="205" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="500" y1="263" x2="528" y2="263" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="530" y="128" width="230" height="44" rx="8" fill="#f7fafc" stroke="#a0aec0" stroke-width="2"/>
+  <text x="645" y="155" text-anchor="middle" fill="#2d3748">stdout (console)</text>
+
+  <rect x="530" y="183" width="230" height="44" rx="8" fill="#f7fafc" stroke="#a0aec0" stroke-width="2"/>
+  <text x="645" y="210" text-anchor="middle" fill="#2d3748">/rosout topic</text>
+
+  <rect x="530" y="235" width="230" height="56" rx="8" fill="#fffff0" stroke="#b7791f" stroke-width="2"/>
+  <text x="645" y="258" text-anchor="middle" font-weight="bold" fill="#744210">rcl_logging_interface</text>
+  <text x="645" y="277" text-anchor="middle" font-size="11" fill="#744210">external library, loaded by rcl</text>
+
+  <!-- backends behind rcl_logging_interface -->
+  <line x1="760" y1="263" x2="775" y2="263" stroke="#444" stroke-width="2"/>
+  <line x1="775" y1="215" x2="775" y2="311" stroke="#444" stroke-width="2"/>
+  <line x1="775" y1="215" x2="788" y2="215" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="775" y1="263" x2="788" y2="263" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="775" y1="311" x2="788" y2="311" stroke="#444" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="790" y="193" width="200" height="44" rx="8" fill="#f7fafc" stroke="#718096" stroke-width="2"/>
+  <text x="890" y="212" text-anchor="middle" font-size="13" font-weight="bold" fill="#2d3748">rcl_logging_spdlog</text>
+  <text x="890" y="229" text-anchor="middle" font-size="11" fill="#4a5568">default, files under ~/.ros/log</text>
+
+  <rect x="790" y="241" width="200" height="44" rx="8" fill="#f7fafc" stroke="#718096" stroke-width="2"/>
+  <text x="890" y="260" text-anchor="middle" font-size="13" font-weight="bold" fill="#2d3748">rcl_logging_syslog</text>
+  <text x="890" y="277" text-anchor="middle" font-size="11" fill="#4a5568">syslog(3) -&gt; rsyslog pipelines</text>
+
+  <rect x="790" y="289" width="200" height="44" rx="8" fill="#fff5e6" stroke="#c05621" stroke-width="3"/>
+  <text x="890" y="308" text-anchor="middle" font-size="13" font-weight="bold" fill="#7b341e">rcl_logging_journal</text>
+  <text x="890" y="325" text-anchor="middle" font-size="11" fill="#7b341e">sd_journal_sendv -&gt; journald</text>
+
+  <!-- backend selection note -->
+  <rect x="20" y="150" width="440" height="110" rx="8" fill="#f7fafc" stroke="#a0aec0" stroke-width="2" stroke-dasharray="6,4"/>
+  <text x="240" y="175" text-anchor="middle" font-size="13" font-weight="bold" fill="#2d3748">which backend does rcl use?</text>
+  <text x="240" y="198" text-anchor="middle" font-size="12" fill="#2d3748">Lyrical and later: RCL_LOGGING_IMPLEMENTATION=&lt;backend&gt;</text>
+  <text x="240" y="216" text-anchor="middle" font-size="11" fill="#4a5568">loaded at runtime by rcl_logging_implementation, no rebuild</text>
+  <text x="240" y="240" text-anchor="middle" font-size="12" fill="#2d3748">Kilted and older: chosen at build time, linked into rcl</text>
+</svg>
