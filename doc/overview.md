@@ -5,11 +5,9 @@ header: "__ROS 2 logging with systemd-journald__"
 footer: "[fujitatomoya@github](https://github.com/fujitatomoya)"
 _backgroundColor: white
 page_number: true
-style: |
-  section { font-size: 26px; }
-  section code { font-size: 20px; }
-  section table { font-size: 20px; }
 ---
+
+![bg right:35% width:300px](./images/QR.png)
 
 # [rcl_logging_journal](https://github.com/fujitatomoya/rcl_logging_journal)
 
@@ -23,20 +21,61 @@ Companion project of rcl_logging_syslog, same repository structure and CI flow.
 
 ---
 
+![bg right:30% width:300px](https://assets.st-note.com/production/uploads/images/192013801/rectangle_large_type_2_841b08d40e4fa8d8600f96be88427411.png)
+
+# Demo
+
+<video controls="controls" width="620" src="https://github.com/user-attachments/assets/df6aa765-af66-480f-aa2f-e06c7c232e02">
+
+<!---
+Recorded demo: talker and listener with rcl_logging_journal, filtered live with journalctl. Same video as the README.
+--->
+
+---
+
+# Demo: per node filtering
+
+```bash
+export RCL_LOGGING_IMPLEMENTATION=rcl_logging_journal
+ros2 run demo_nodes_cpp talker &
+ros2 run demo_nodes_py listener &
+
+journalctl -f ROS2_NODE_NAME=listener
+journalctl -p warning ROS2_DISTRO=rolling
+journalctl ROS2_NODE_NAME=talker -o verbose -n 1
+```
+
+<!---
+Live demo: start talker and listener, switch filters, show -o verbose with trusted fields.
+--->
+
+---
+
+# Demo: container to host journal
+
+```bash
+docker run -it --rm \
+  -v /run/systemd/journal/socket:/run/systemd/journal/socket \
+  -e RCL_LOGGING_IMPLEMENTATION=rcl_logging_journal \
+  my_ros2_image ros2 run demo_nodes_cpp talker
+
+# on the HOST
+journalctl -f ROS2_NODE_NAME=talker
+```
+
+- One bind mount, nothing installed or started in the image.
+- Host journald owns storage, rotation, retention for every container.
+- `_SYSTEMD_CGROUP` / your `CONTAINER=` field tell containers apart.
+
+<!---
+The native socket, not /dev/log. Only libsystemd0 is needed in the image, which every Debian/Ubuntu image has.
+--->
+
+---
+
 # ROS 2 logging subsystem
 
-```
-rclcpp / rclpy  ->  rcutils logging  ->  rcl output handlers
-                                         |-- stdout (console)
-                                         |-- /rosout topic
-                                         `-- external library: rcl_logging_interface
-                                             |-- rcl_logging_spdlog  (default, files under ~/.ros/log)
-                                             |-- rcl_logging_syslog  (syslog(3) -> rsyslog pipelines)
-                                             `-- rcl_logging_journal (sd_journal_sendv -> journald)
-```
-
-- `rcl_logging_interface`: 4 functions, `initialize / log / set_logger_level / shutdown`.
-- Lyrical and later: `RCL_LOGGING_IMPLEMENTATION=<backend>` loads it at runtime.
+![w:960](./images/ros2_logging_subsystem.svg)
 
 <!---
 The interface is tiny, which is why alternative backends are cheap to write and safe to swap.
@@ -44,9 +83,9 @@ The interface is tiny, which is why alternative backends are cheap to write and 
 
 ---
 
-# The pain
+# What's the Pain?
 
-- ROS 2 writes log **files**, but ships no log **reader**.
+- ROS 2 writes log **files** in default with spdlog, but ships no log **reader**.
 - `~/.ros/log/<exe>_<pid>_<stamp>.log` per process: `grep`, `less`, hand made `logrotate`.
 - No "all WARN+ of node X in the last 10 minutes", no "what happened before the reboot".
 - Nothing in the file proves *which* process wrote it.
@@ -126,7 +165,6 @@ One backend, one socket, one daemon that is already running.
 | `set_logger_level` | ignored: rcl filters first, journald has `MaxLevelStore=` |
 | `shutdown` | drain the ring, report undeliverable count |
 
-- One `sendmsg()` to journald costs ~6.5 µs; a memcpy costs 0.01 µs. The caller pays the memcpy.
 - FATAL is synchronous: journald fsyncs `CRIT`, so FATAL + crash is on disk.
 - Order preserved (one consumer), nothing dropped (full ring blocks), exit drains.
 
@@ -154,96 +192,7 @@ Same philosophy as RCL_LOGGING_SYSLOG_FACILITY: sane defaults, a few env vars.
 
 ---
 
-# Demo: per node filtering
-
-```bash
-export RCL_LOGGING_IMPLEMENTATION=rcl_logging_journal
-ros2 run demo_nodes_cpp talker &
-ros2 run demo_nodes_py listener &
-
-journalctl -f ROS2_NODE_NAME=listener
-journalctl -p warning ROS2_DISTRO=rolling
-journalctl ROS2_NODE_NAME=talker -o verbose -n 1
-```
-
-<!---
-Live demo: start talker and listener, switch filters, show -o verbose with trusted fields.
---->
-
----
-
-# Demo: container to host journal
-
-```bash
-docker run -it --rm \
-  -v /run/systemd/journal/socket:/run/systemd/journal/socket \
-  -e RCL_LOGGING_IMPLEMENTATION=rcl_logging_journal \
-  my_ros2_image ros2 run demo_nodes_cpp talker
-
-# on the HOST
-journalctl -f ROS2_NODE_NAME=talker
-```
-
-- One bind mount, nothing installed or started in the image.
-- Host journald owns storage, rotation, retention for every container.
-- `_SYSTEMD_CGROUP` / your `CONTAINER=` field tell containers apart.
-
-<!---
-The native socket, not /dev/log. Only libsystemd0 is needed in the image, which every Debian/Ubuntu image has.
---->
-
----
-
-# Caveats, documented not hidden
-
-- **Rate limiting**: 10000 msgs / 30 s per service by default, `Suppressed N messages`.
-  Raise with `LogRateLimitBurst=` (unit) or `RateLimitBurst=` (global).
-- **No systemd** (Alpine, bare containers): strict init error, or `RCL_LOGGING_JOURNAL_STRICT=0`.
-- **Throughput**: journald rate limits and may saturate at extreme rates; B3 shows where.
-- **Logger name != node name** for hierarchical loggers (`talker.child`).
-
-<!---
-The benchmark harness quantifies the rate limit and the throughput crossover on the target.
---->
-
----
-
-# Performance: measure, do not assume
-
-`scripts/benchmark/run_matrix.sh`, same driver for spdlog (baseline) and journal:
-
-| id | question | metric |
-|---|---|---|
-| B1 | client call cost | p50 / p95 / p99 per `rcl_logging_external_log` |
-| B2 | system cost | app + daemon CPU ms per 1 k records |
-| B3 | throughput & loss | delivered vs sent, journald suppressed |
-| B4 | storage | bytes on disk, identical workload |
-| B5 | query | `journalctl` match vs `grep` |
-
-<!---
-Numbers depend on the host. Run it on the robot, publish REPORT.md.
---->
-
----
-
-# Positioning
-
-| | rcl_logging_syslog | rcl_logging_journal |
-|---|---|---|
-| record | text line | indexed fields |
-| daemons | journald + rsyslogd | journald |
-| setup | rsyslog conf, /var/log/ros | none |
-| reading logs | files, `grep`, `less` | `journalctl` on system managed storage |
-| FluentBit / Fluentd | rsyslog forward | journald input (planned, same architecture) |
-
-- The major difference: developers do not manage logs at all, `journalctl` just works.
-- Forwarding pipelines are a temporary gap, not a design limit.
-
-<!---
-FluentBit has a systemd input, Fluentd has fluent-plugin-systemd. Both read the journal directly with the ROS 2 fields already structured. Same interface, same CI, same branches as rcl_logging_syslog.
---->
-
----
+![bg right:35% width:300px](./images/QR.png)
 
 ## Issues and PRs always welcome 🚀
 
