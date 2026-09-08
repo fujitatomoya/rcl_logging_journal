@@ -31,6 +31,10 @@ The log pipeline capability of `rcl_logging_syslog` (rsyslog to [FluentBit](http
 
 ## Demonstration
 
+See how it works 🔥
+
+https://github.com/user-attachments/assets/df6aa765-af66-480f-aa2f-e06c7c232e02
+
 ```bash
 export RCL_LOGGING_IMPLEMENTATION=rcl_logging_journal
 ros2 run demo_nodes_cpp talker &
