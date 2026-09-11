@@ -25,14 +25,16 @@ after the PR is merged. Whether a fix is backported follows the ABI verdict
 of the [abi workflow](.github/workflows/abi.yaml), per
 [REP-0009](https://ros.org/reps/rep-0009.html):
 
-| ABI verdict label | Backport labels set by CI | Result after merge |
+| ABI verdict label | Backport labels set by Mergify | Result after merge |
 | --- | --- | --- |
 | `ABI compatible` | `backport-all` (unless `backport-<distro>` or `skip-backport` is already set) | backported to every supported distribution |
 | `ABI break` | `skip-backport`, any `backport-*` removed | not backported; released branches must keep their ABI |
 | none (diff could not be produced) | untouched | no automatic backport; a reviewer opts in with `backport-*` labels |
 
 Reviewers can still narrow a compatible change to specific distributions by
-setting `backport-<distro>` labels before the check completes, or block it
-with `skip-backport`. A `skip-backport` set by a person is never removed by
-CI. Mergify refuses to backport any PR that carries the `ABI break` label,
-regardless of other labels.
+removing `backport-all` and setting `backport-<distro>` labels, or block it
+with `skip-backport`. Mergify refuses to backport any PR that carries the
+`ABI break` label, regardless of other labels; to force one, remove
+`ABI break` and `skip-backport` by hand, then add the wanted `backport-*`
+label. If a PR was flagged `ABI break` and a later push makes it compatible,
+`skip-backport` stays until a reviewer removes it.

@@ -1,40 +1,34 @@
-# This workflow checks ABI compatibility of librcl_logging_journal.so on every PR
-# and turns the verdict into backport labels for Mergify.
+# ABI compatibility check for librcl_logging_journal.so on every pull request.
 #
-# It uses the reusable ros2-abi-action workflow, which:
-#   1. resolves the ROS 2 distro from the PR's target branch (rolling/lyrical/kilted/jazzy/humble),
-#   2. builds the package twice in the matching ghcr.io/fujitatomoya/ros-abi:<distro> container
-#      (once against the target branch, once against the PR head) with -g -Og so DWARF
-#      debug info is present,
+# This is a thin wrapper around the reusable ros2-abi-action workflow, which:
+#   1. resolves the ROS 2 distro from the PR target branch (rolling/lyrical/kilted/jazzy/humble),
+#   2. builds the package twice in the matching ghcr.io/fujitatomoya/ros-abi:<distro>
+#      container (once against the target branch, once against the PR head) with
+#      -g -Og so DWARF debug info is present,
 #   3. delegates the binary ABI diff to fujitatomoya/libabigail-action (abidiff),
-#   4. applies REP-0009 policy automatically: released distros (humble/jazzy/kilted/lyrical)
-#      fail on an incompatible ABI break, rolling is advisory only,
+#   4. applies REP-0009 policy automatically: released distros fail on an
+#      incompatible ABI break, rolling is advisory only,
 #   5. surfaces the verdict as a sticky PR comment, a label, and a pass/fail check.
-#      The label is reconciled on every run: exactly one of "ABI compatible" / "ABI break"
-#      remains, or neither when the diff could not be produced (e.g. build error).
+#      Exactly one of the two labels remains after a run, or neither when the diff
+#      could not be produced (e.g. build error).
 #
-# The second job maps that verdict onto the backport labels consumed by .mergify/config.yml
-# (PRs targeting rolling only, since backports always originate from rolling):
-#   - "ABI break"      -> add "skip-backport", drop every "backport-*" label.
-#                         An incompatible change must not land on a released, ABI-stable branch.
-#   - "ABI compatible" -> drop a "skip-backport" that this workflow added earlier (a human's
-#                         "skip-backport" is kept), then add "backport-all" unless a reviewer
-#                         already chose specific "backport-<distro>" labels or "skip-backport".
-#   - no verdict       -> leave the labels untouched; Mergify then does not auto-backport and
-#                         a reviewer decides with explicit "backport-*" labels.
+# The labels are consumed by .mergify/config.yml to decide backports:
+#   "ABI compatible" -> backport-all  -> backported to every supported distribution,
+#   "ABI break"      -> skip-backport -> not backported anywhere.
+# Keep the label names below and the ones in .mergify/config.yml in sync.
 #
-# Note: on pull requests from forks GITHUB_TOKEN is read-only, so neither the action nor this
-# workflow can edit labels; the check result itself is still reported.
-#
-# See https://github.com/fujitatomoya/ros2-abi-action for details.
+# See https://github.com/fujitatomoya/ros2-abi-action for all inputs and details.
 name: abi
 
 on:
   pull_request:
     branches: [ "rolling", "lyrical", "kilted", "jazzy", "humble" ]
 
-  # Allows you to run this workflow manually from the Actions tab.
-  workflow_dispatch:
+# A new push to the same PR supersedes the previous ABI run, so a stale run
+# cannot overwrite the labels of a newer one.
+concurrency:
+  group: abi-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   abi:
@@ -42,118 +36,18 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    # Pin to the major tag (@v1) once it is moved past the container/underlay fixes on main.
+    # TODO(fujitatomoya): pin to @v1 once the tag is moved past the fixes
+    # currently only on main (v1 still points at 1.0.0).
     uses: fujitatomoya/ros2-abi-action/.github/workflows/check.yml@main
     with:
-      # Colcon package name to build. Space-separated list for multi-package repos.
+      # Colcon package name to build. Built in the default binary mode, i.e. against
+      # the released ros-<distro>-* packages, which is right for a downstream package.
       package: rcl_logging_journal
-      # Shared library produced by this package (a glob such as 'lib*.so' is also accepted).
+      # Shared library produced by this package.
       soname: librcl_logging_journal.so
-      # auto -> distro derived from the PR target branch.
-      distro: auto
-      # binary -> build against the released ros-<distro>-* packages in /opt/ros/<distro>.
-      # This is a downstream package, so the released binaries are the right baseline;
-      # 'source' is only for ROS 2 core repositories whose deps are ahead of the binaries.
-      build-mode: binary
-      # auto -> REP-0009: strict on released distros, advisory on rolling.
-      policy: auto
-      # Optional per-repo libabigail suppression spec, merged with the action's default ROS
-      # suppressions (std:: churn, detail/impl symbols). A configured-but-missing file is
-      # reported as a warning on every run, so only enable this once .abignore exists.
-      # suppressions: .abignore
-      # Labels applied by the action; .mergify/config.yml and the job below depend on them.
+      # Labels applied from the verdict; .mergify/config.yml keys off these.
       label-compat: ABI compatible
       label-break: ABI break
-
-  # Translate the ABI verdict into the backport labels that Mergify acts on after merge.
-  backport-labels:
-    needs: abi
-    # always(): under strict policy the abi job fails on a break, but the label has already
-    # been applied and that is exactly the case that must block the backport.
-    if: >-
-      always() &&
-      github.event_name == 'pull_request' &&
-      github.base_ref == 'rolling'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      LABEL_COMPAT: ABI compatible
-      LABEL_BREAK: ABI break
-      LABEL_SKIP: skip-backport
-      LABEL_ALL: backport-all
-    steps:
-      - name: Sync backport labels with the ABI verdict
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Current labels, one per line (re-read from the API, not from the stale event payload).
-          mapfile -t labels < <(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/labels" --paginate --jq '.[].name')
-
-          has_label() {
-            local needle=$1 l
-            for l in "${labels[@]}"; do [[ "$l" == "$needle" ]] && return 0; done
-            return 1
-          }
-          add_label() {
-            has_label "$1" && return 0
-            gh api -X POST "repos/${GH_REPO}/issues/${PR_NUMBER}/labels" -f "labels[]=$1" >/dev/null
-            echo "added label: $1"
-          }
-          # Percent-encode a label name for use as a URL path segment (labels may contain spaces).
-          urlencode() {
-            local s=$1 out="" c i
-            for ((i = 0; i < ${#s}; i++)); do
-              c=${s:i:1}
-              case "$c" in
-                [a-zA-Z0-9._~-]) out+=$c ;;
-                *) out+=$(printf '%%%02X' "'$c") ;;
-              esac
-            done
-            printf '%s' "$out"
-          }
-          remove_label() {
-            has_label "$1" || return 0
-            gh api -X DELETE "repos/${GH_REPO}/issues/${PR_NUMBER}/labels/$(urlencode "$1")" >/dev/null
-            echo "removed label: $1"
-          }
-          # Login of the actor that most recently added the given label, or empty.
-          # Events are chronological and --jq runs per page, so the last line wins.
-          last_labeler() {
-            gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/events" --paginate \
-              --jq "[.[] | select(.event == \"labeled\" and .label.name == \"$1\")] | last | .actor.login // empty" \
-              | tail -n 1
-          }
-
-          if has_label "$LABEL_BREAK"; then
-            echo "verdict: ABI break -> no backport"
-            add_label "$LABEL_SKIP"
-            for l in "${labels[@]}"; do
-              [[ "$l" == backport-* ]] && remove_label "$l"
-            done
-
-          elif has_label "$LABEL_COMPAT"; then
-            echo "verdict: ABI compatible -> backport to all supported distros"
-            # Only undo our own earlier decision; keep a skip-backport set by a person.
-            if has_label "$LABEL_SKIP" && [[ "$(last_labeler "$LABEL_SKIP")" == "github-actions[bot]" ]]; then
-              remove_label "$LABEL_SKIP"
-              kept=(); for l in "${labels[@]}"; do [[ "$l" != "$LABEL_SKIP" ]] && kept+=("$l"); done
-              labels=("${kept[@]}")
-            fi
-            if has_label "$LABEL_SKIP"; then
-              echo "skip-backport was set by a reviewer; leaving backport labels untouched"
-            elif printf '%s\n' "${labels[@]}" | grep -q '^backport-'; then
-              echo "explicit backport-* label(s) already present; leaving them untouched"
-            else
-              add_label "$LABEL_ALL"
-            fi
-
-          else
-            echo "no ABI verdict label on the PR (diff not produced); leaving backport labels untouched"
-          fi
+      # Uncomment to filter known-benign ABI deltas with a repo-level spec.
+      # A configured-but-missing file is reported as a warning on every run.
+      # suppressions: .abignore
