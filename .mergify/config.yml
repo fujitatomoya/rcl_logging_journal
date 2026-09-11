@@ -1,11 +1,20 @@
+# Backport rules. The ABI verdict labels ("ABI compatible" / "ABI break") are set by
+# .github/workflows/abi.yaml, which also derives "skip-backport" / "backport-all" from them.
+# The conditions below make the same policy hold even if that labeling step did not run:
+#   - an ABI-incompatible change is never backported to a released, ABI-stable branch,
+#   - an automatic backport requires a positive "ABI compatible" verdict,
+#   - without a verdict, a reviewer opts in with explicit backport-* labels.
 pull_request_rules:
   - name: automatic backport to all supported distribution
     description: |
-      This rule backports a PR to all supported distribution branches when it is merged,
-      unless an explicit backport-* label selects the target branches.
+      This rule backports a PR to all supported distribution branches when it is merged
+      with an "ABI compatible" verdict, unless an explicit backport-* label selects the
+      target branches.
     conditions:
       - base=rolling
       - merged
+      - label=ABI compatible  # Positive verdict from abi.yaml is required for auto backport
+      - label!=ABI break  # Never backport an ABI break to released distributions
       - label!=skip-backport  # Do not backport if this label exists
       - -label~=^backport-  # Explicit backport-* labels take over (rules below)
     actions:
@@ -23,6 +32,7 @@ pull_request_rules:
       - base=rolling
       - "label=backport-all"
       - merged
+      - label!=ABI break  # Never backport an ABI break to released distributions
       - label!=skip-backport  # Do not backport if this label exists
     actions:
       backport:
@@ -39,6 +49,7 @@ pull_request_rules:
       - base=rolling
       - "label=backport-lyrical"
       - merged
+      - label!=ABI break  # Never backport an ABI break to released distributions
       - label!=skip-backport  # Do not backport if this label exists
     actions:
       backport:
@@ -52,6 +63,7 @@ pull_request_rules:
       - base=rolling
       - "label=backport-kilted"
       - merged
+      - label!=ABI break  # Never backport an ABI break to released distributions
       - label!=skip-backport  # Do not backport if this label exists
     actions:
       backport:
@@ -65,6 +77,7 @@ pull_request_rules:
       - base=rolling
       - "label=backport-jazzy"
       - merged
+      - label!=ABI break  # Never backport an ABI break to released distributions
       - label!=skip-backport  # Do not backport if this label exists
     actions:
       backport:
@@ -78,6 +91,7 @@ pull_request_rules:
       - base=rolling
       - "label=backport-humble"
       - merged
+      - label!=ABI break  # Never backport an ABI break to released distributions
       - label!=skip-backport  # Do not backport if this label exists
     actions:
       backport:
