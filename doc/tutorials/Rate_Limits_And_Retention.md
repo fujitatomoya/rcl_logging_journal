@@ -19,7 +19,7 @@ The restart is safe; journald keeps the existing files and nodes reconnect trans
 
 ## 1. Rate limiting: the one surprise
 
-journald drops messages from a **service** (cgroup) that sends more than `RateLimitBurst` messages within `RateLimitIntervalSec`. Defaults are `10000` per `30s`, and the burst is scaled by the free space on the journal file system (down to 1x at 1 MiB free, up to 6x at 64 GiB free).
+journald drops messages from a **service** (cgroup) that sends more than `RateLimitBurst` messages within `RateLimitIntervalSec`. Defaults are `10000` per `30s`, and the burst is scaled by the free space on the journal file system (1x at 1 MiB free, 5x at 64 GiB, 6x at 1 TiB).
 
 A ROS 2 node at DEBUG level with a 100 Hz timer and a few log lines per cycle reaches 10000 messages in about 30 s. When that happens the journal contains:
 
